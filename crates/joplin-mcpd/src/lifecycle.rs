@@ -195,4 +195,13 @@ mod tests {
         let started = Instant::now() - Duration::from_secs(2);
         assert!(should_log_slow_request(started, Duration::from_secs(1)));
     }
+
+    #[test]
+    fn slow_request_threshold_ignores_fast_requests() {
+        let started = Instant::now() - Duration::from_millis(100);
+        assert!(!should_log_slow_request(
+            started,
+            Duration::from_millis(1000)
+        ));
+    }
 }

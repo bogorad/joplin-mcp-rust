@@ -18,6 +18,10 @@ This document records the v1 metric, trace, and alert contract. Labels must stay
 - Index refresh: `index.refresh`, `index.source_query`, `index.row_upserts`, `index.state_update`, with `index.full_rebuild` when a rebuild is required.
 - MCP tool call: `mcp.tool_call`.
 
+## Request Logs
+
+- Request middleware emits `http_request` logs for `started`, `completed`, and `slow` outcomes. Completed and slow logs include `http.request.duration_ms`; slow logs also include `server.slow_request_log_threshold_ms`.
+
 ## Index Memory
 
 - Joplin source reads use keyset batches of 500 raw items before parsing/upserting. This bounds live note-body fetches during full rebuild and incremental refresh.

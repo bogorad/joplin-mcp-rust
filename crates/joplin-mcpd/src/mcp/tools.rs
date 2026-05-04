@@ -981,30 +981,56 @@ pub async fn search_notes_tool(
         .map(|cursor| decode_cursor(cursor, cursor_signing_key, "search_notes", &filter_hash))
         .transpose()?;
     let after = cursor.as_ref().map(search_cursor_values).transpose()?;
-    let mut rows = fetch_search_note_rows(
-        pool,
-        scope,
-        &request,
-        text_search_config,
-        request.limit + 1,
-        after.clone(),
-        SearchMode::FullText,
-    )
-    .await?;
-    let fallback_used =
-        rows.is_empty() && request.query.chars().count() <= ILIKE_FALLBACK_MAX_QUERY_CHARS;
-    if fallback_used {
-        rows = fetch_search_note_rows(
+    let (rows, cursor_mode, fallback_used) = if after
+        .as_ref()
+        .is_some_and(|cursor| cursor.mode == SearchMode::IlikeFallback)
+    {
+        (
+            fetch_search_note_rows(
+                pool,
+                scope,
+                &request,
+                text_search_config,
+                request.limit + 1,
+                after.clone(),
+                SearchMode::IlikeFallback,
+            )
+            .await?,
+            SearchMode::IlikeFallback,
+            true,
+        )
+    } else {
+        let mut rows = fetch_search_note_rows(
             pool,
             scope,
             &request,
             text_search_config,
             request.limit + 1,
-            after,
-            SearchMode::IlikeFallback,
+            after.clone(),
+            SearchMode::FullText,
         )
         .await?;
-    }
+
+        if search_notes_should_use_ilike_fallback(
+            after.as_ref(),
+            rows.is_empty(),
+            request.query.chars().count(),
+        ) {
+            rows = fetch_search_note_rows(
+                pool,
+                scope,
+                &request,
+                text_search_config,
+                request.limit + 1,
+                None,
+                SearchMode::IlikeFallback,
+            )
+            .await?;
+            (rows, SearchMode::IlikeFallback, true)
+        } else {
+            (rows, SearchMode::FullText, false)
+        }
+    };
     let has_more = rows.len() as i64 > request.limit;
     let notes: Vec<SearchNoteItem> = rows
         .into_iter()
@@ -1014,7 +1040,7 @@ pub async fn search_notes_tool(
     let next_cursor = if has_more {
         notes
             .last()
-            .map(|note| encode_search_cursor(note, &filter_hash, cursor_signing_key))
+            .map(|note| encode_search_cursor(note, cursor_mode, &filter_hash, cursor_signing_key))
             .transpose()?
     } else {
         None
@@ -1400,13 +1426,115 @@ async fn fetch_note_list_rows(
     .map_err(|error| ToolError::internal("failed to list notes", error))
 }
 
+const FULL_TEXT_SEARCH_QUERY: &str = r#"
+WITH ranked AS (
+    SELECT
+        notes.joplin_id,
+        notes.title,
+        notes.parent_joplin_id AS notebook_id,
+        notes.updated_time,
+        notes.body_text,
+        COALESCE(notes.updated_time, 0) AS updated_time_key,
+        ts_rank(notes.search_vector, plainto_tsquery($2::regconfig, $3)) AS rank
+    FROM joplin_mcp.notes_index notes
+    WHERE notes.user_id = $1
+        AND notes.deleted_time IS NULL
+        AND notes.search_vector @@ plainto_tsquery($2::regconfig, $3)
+        AND ($4::text IS NULL OR notes.parent_joplin_id = $4)
+        AND ($5::bigint IS NULL OR notes.updated_time >= $5)
+        AND ($6::bigint IS NULL OR notes.updated_time <= $6)
+        AND ($7::boolean IS NULL OR notes.is_todo = $7)
+        AND (
+            cardinality($8::text[]) = 0
+            OR NOT EXISTS (
+                SELECT 1
+                FROM unnest($8::text[]) AS required(tag_id)
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM joplin_mcp.note_tags_index edges
+                    WHERE edges.user_id = notes.user_id
+                        AND edges.note_joplin_id = notes.joplin_id
+                        AND edges.tag_joplin_id = required.tag_id
+                )
+            )
+        )
+),
+candidates AS (
+    SELECT
+        ranked.*,
+        round((rank::double precision * 1000000000.0))::bigint AS rank_key
+    FROM ranked
+)
+SELECT
+    joplin_id,
+    title,
+    notebook_id,
+    updated_time,
+    body_text,
+    rank,
+    rank_key
+FROM candidates
+WHERE (
+    $9::bigint IS NULL
+    OR rank_key < $9
+    OR (rank_key = $9 AND updated_time_key < $10)
+    OR (rank_key = $9 AND updated_time_key = $10 AND joplin_id < $11)
+)
+ORDER BY rank_key DESC, updated_time_key DESC, joplin_id DESC
+LIMIT $12
+"#;
+
+const ILIKE_SEARCH_QUERY: &str = r#"
+SELECT
+    notes.joplin_id,
+    notes.title,
+    notes.parent_joplin_id AS notebook_id,
+    notes.updated_time,
+    notes.body_text,
+    0::real AS rank,
+    0::bigint AS rank_key
+FROM joplin_mcp.notes_index notes
+WHERE notes.user_id = $1
+    AND notes.deleted_time IS NULL
+    AND (
+        notes.title ILIKE '%' || $3 || '%' ESCAPE '!'
+        OR notes.body_text ILIKE '%' || $3 || '%' ESCAPE '!'
+    )
+    AND ($4::text IS NULL OR notes.parent_joplin_id = $4)
+    AND ($5::bigint IS NULL OR notes.updated_time >= $5)
+    AND ($6::bigint IS NULL OR notes.updated_time <= $6)
+    AND ($7::boolean IS NULL OR notes.is_todo = $7)
+    AND (
+        cardinality($8::text[]) = 0
+        OR NOT EXISTS (
+            SELECT 1
+            FROM unnest($8::text[]) AS required(tag_id)
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM joplin_mcp.note_tags_index edges
+                WHERE edges.user_id = notes.user_id
+                    AND edges.note_joplin_id = notes.joplin_id
+                    AND edges.tag_joplin_id = required.tag_id
+            )
+        )
+    )
+    AND (
+        $9::bigint IS NULL
+        OR 0::bigint < $9
+        OR (0::bigint = $9 AND COALESCE(notes.updated_time, 0) < $10)
+        OR (0::bigint = $9 AND COALESCE(notes.updated_time, 0) = $10 AND notes.joplin_id < $11)
+    )
+ORDER BY rank_key DESC, COALESCE(notes.updated_time, 0) DESC, notes.joplin_id DESC
+LIMIT $12
+"#;
+
 async fn fetch_search_note_rows(
     pool: &PgPool,
     scope: &UserScope,
     request: &SearchNotesRequest,
     text_search_config: &str,
     limit: i64,
-    after: Option<(f32, i64, String)>,
+    after: Option<SearchCursorValues>,
     mode: SearchMode,
 ) -> Result<Vec<SearchNoteRow>, ToolError> {
     let search_query = match mode {
@@ -1414,98 +1542,8 @@ async fn fetch_search_note_rows(
         SearchMode::IlikeFallback => escape_ilike_pattern(&request.query),
     };
     let query = match mode {
-        SearchMode::FullText => {
-            r#"
-            SELECT
-                notes.joplin_id,
-                notes.title,
-                notes.parent_joplin_id AS notebook_id,
-                notes.updated_time,
-                notes.body_text,
-                ts_rank(notes.search_vector, plainto_tsquery($2::regconfig, $3)) AS rank
-            FROM joplin_mcp.notes_index notes
-            WHERE notes.user_id = $1
-                AND notes.deleted_time IS NULL
-                AND notes.search_vector @@ plainto_tsquery($2::regconfig, $3)
-                AND ($4::text IS NULL OR notes.parent_joplin_id = $4)
-                AND ($5::bigint IS NULL OR notes.updated_time >= $5)
-                AND ($6::bigint IS NULL OR notes.updated_time <= $6)
-                AND ($7::boolean IS NULL OR notes.is_todo = $7)
-                AND (
-                    cardinality($8::text[]) = 0
-                    OR NOT EXISTS (
-                        SELECT 1
-                        FROM unnest($8::text[]) AS required(tag_id)
-                        WHERE NOT EXISTS (
-                            SELECT 1
-                            FROM joplin_mcp.note_tags_index edges
-                            WHERE edges.user_id = notes.user_id
-                                AND edges.note_joplin_id = notes.joplin_id
-                                AND edges.tag_joplin_id = required.tag_id
-                        )
-                    )
-                )
-                AND (
-                    $9::real IS NULL
-                    OR ts_rank(notes.search_vector, plainto_tsquery($2::regconfig, $3)) < $9
-                    OR (
-                        ts_rank(notes.search_vector, plainto_tsquery($2::regconfig, $3)) = $9
-                        AND COALESCE(notes.updated_time, 0) < $10
-                    )
-                    OR (
-                        ts_rank(notes.search_vector, plainto_tsquery($2::regconfig, $3)) = $9
-                        AND COALESCE(notes.updated_time, 0) = $10
-                        AND notes.joplin_id < $11
-                    )
-                )
-            ORDER BY rank DESC, COALESCE(notes.updated_time, 0) DESC, notes.joplin_id DESC
-            LIMIT $12
-            "#
-        }
-        SearchMode::IlikeFallback => {
-            r#"
-            SELECT
-                notes.joplin_id,
-                notes.title,
-                notes.parent_joplin_id AS notebook_id,
-                notes.updated_time,
-                notes.body_text,
-                0::real AS rank
-            FROM joplin_mcp.notes_index notes
-            WHERE notes.user_id = $1
-                AND notes.deleted_time IS NULL
-                AND (
-                    notes.title ILIKE '%' || $3 || '%' ESCAPE '!'
-                    OR notes.body_text ILIKE '%' || $3 || '%' ESCAPE '!'
-                )
-                AND ($4::text IS NULL OR notes.parent_joplin_id = $4)
-                AND ($5::bigint IS NULL OR notes.updated_time >= $5)
-                AND ($6::bigint IS NULL OR notes.updated_time <= $6)
-                AND ($7::boolean IS NULL OR notes.is_todo = $7)
-                AND (
-                    cardinality($8::text[]) = 0
-                    OR NOT EXISTS (
-                        SELECT 1
-                        FROM unnest($8::text[]) AS required(tag_id)
-                        WHERE NOT EXISTS (
-                            SELECT 1
-                            FROM joplin_mcp.note_tags_index edges
-                            WHERE edges.user_id = notes.user_id
-                                AND edges.note_joplin_id = notes.joplin_id
-                                AND edges.tag_joplin_id = required.tag_id
-                        )
-                    )
-                )
-                AND (
-                    $9::real IS NULL
-                    OR 0::real < $9
-                    OR (0::real = $9 AND COALESCE(notes.updated_time, 0) < $10)
-                    OR (0::real = $9 AND COALESCE(notes.updated_time, 0) = $10 AND notes.joplin_id < $11)
-                )
-            ORDER BY rank DESC, COALESCE(notes.updated_time, 0) DESC, notes.joplin_id DESC
-            LIMIT $12
-            "#
-        }
+        SearchMode::FullText => FULL_TEXT_SEARCH_QUERY,
+        SearchMode::IlikeFallback => ILIKE_SEARCH_QUERY,
     };
 
     let mut conn = acquire_runtime_connection(pool).await?;
@@ -1519,9 +1557,9 @@ async fn fetch_search_note_rows(
         .bind(request.updated_before)
         .bind(request.is_todo)
         .bind(&request.tag_ids)
-        .bind(after.as_ref().map(|(rank, _, _)| *rank))
-        .bind(after.as_ref().map(|(_, updated_time, _)| *updated_time))
-        .bind(after.as_ref().map(|(_, _, joplin_id)| joplin_id.as_str()))
+        .bind(after.as_ref().map(|cursor| cursor.rank_key))
+        .bind(after.as_ref().map(|cursor| cursor.updated_time))
+        .bind(after.as_ref().map(|cursor| cursor.joplin_id.as_str()))
         .bind(limit)
         .fetch_all(&mut *conn)
         .await
@@ -1558,6 +1596,60 @@ async fn fetch_note_body_row(
     .ok_or_else(|| ToolError::not_found("note not found"))
 }
 
+const CHANGES_SINCE_QUERY: &str = r#"
+WITH changes AS (
+    SELECT
+        notes.joplin_id,
+        notes.title,
+        notes.parent_joplin_id AS notebook_id,
+        notes.updated_time,
+        false AS deleted,
+        NULL::int AS item_type,
+        NULL::text AS source,
+        NULL::bigint AS deleted_time
+    FROM joplin_mcp.notes_index notes
+    WHERE notes.user_id = $1
+        AND notes.deleted_time IS NULL
+        AND notes.updated_time > $2
+    UNION ALL
+    SELECT
+        deleted.joplin_id,
+        NULL::text AS title,
+        NULL::text AS notebook_id,
+        COALESCE(
+            deleted.deleted_time,
+            floor(extract(epoch from deleted.tombstoned_at) * 1000)::bigint
+        ) AS updated_time,
+        true AS deleted,
+        deleted.item_type,
+        deleted.source,
+        deleted.deleted_time
+    FROM joplin_mcp.deleted_items_index deleted
+    WHERE deleted.user_id = $1
+        AND COALESCE(
+            deleted.deleted_time,
+            floor(extract(epoch from deleted.tombstoned_at) * 1000)::bigint
+        ) > $2
+)
+SELECT
+    joplin_id,
+    title,
+    notebook_id,
+    updated_time,
+    deleted,
+    item_type,
+    source,
+    deleted_time
+FROM changes
+WHERE (
+    $3::bigint IS NULL
+    OR updated_time > $3
+    OR (updated_time = $3 AND joplin_id > $4)
+)
+ORDER BY updated_time ASC, joplin_id ASC
+LIMIT $5
+"#;
+
 async fn fetch_changes_since_rows(
     pool: &PgPool,
     scope: &UserScope,
@@ -1567,34 +1659,15 @@ async fn fetch_changes_since_rows(
 ) -> Result<Vec<NoteChange>, ToolError> {
     let mut conn = acquire_runtime_connection(pool).await?;
 
-    sqlx::query_as::<_, NoteChange>(
-        r#"
-        SELECT
-            notes.joplin_id,
-            notes.title,
-            notes.parent_joplin_id AS notebook_id,
-            notes.updated_time
-        FROM joplin_mcp.notes_index notes
-        WHERE notes.user_id = $1
-            AND notes.deleted_time IS NULL
-            AND notes.updated_time > $2
-            AND (
-                $3::bigint IS NULL
-                OR notes.updated_time > $3
-                OR (notes.updated_time = $3 AND notes.joplin_id > $4)
-            )
-        ORDER BY notes.updated_time ASC, notes.joplin_id ASC
-        LIMIT $5
-        "#,
-    )
-    .bind(scope.user_id())
-    .bind(since)
-    .bind(after.as_ref().map(|(updated_time, _)| *updated_time))
-    .bind(after.as_ref().map(|(_, joplin_id)| joplin_id.as_str()))
-    .bind(limit)
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(|error| ToolError::internal("failed to get changes since timestamp", error))
+    sqlx::query_as::<_, NoteChange>(CHANGES_SINCE_QUERY)
+        .bind(scope.user_id())
+        .bind(since)
+        .bind(after.as_ref().map(|(updated_time, _)| *updated_time))
+        .bind(after.as_ref().map(|(_, joplin_id)| joplin_id.as_str()))
+        .bind(limit)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|error| ToolError::internal("failed to get changes since timestamp", error))
 }
 
 async fn fetch_note_resource_refs(
@@ -1717,26 +1790,54 @@ fn encode_updated_desc_cursor(
     )
 }
 
-fn search_cursor_values(payload: &CursorPayload) -> Result<(f32, i64, String), ToolError> {
-    if payload.sort_keys != ["rank", "updated_time", "joplin_id"] || payload.last_values.len() != 3
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchCursorValues {
+    mode: SearchMode,
+    rank_key: i64,
+    updated_time: i64,
+    joplin_id: String,
+}
+
+fn search_cursor_values(payload: &CursorPayload) -> Result<SearchCursorValues, ToolError> {
+    if payload.sort_keys == ["rank", "updated_time", "joplin_id"] {
+        return Err(ToolError::validation(
+            "stale search_notes cursor; repeat search without cursor",
+        ));
+    }
+    if payload.sort_keys != ["mode", "rank_key", "updated_time", "joplin_id"]
+        || payload.last_values.len() != 4
     {
         return Err(ToolError::validation("invalid search_notes cursor"));
     }
-    let rank = payload.last_values[0]
-        .as_f64()
-        .ok_or_else(|| ToolError::validation("invalid search_notes cursor rank"))?
-        as f32;
-    let updated_time = payload.last_values[1]
+    let mode = payload.last_values[0]
+        .as_str()
+        .ok_or_else(|| ToolError::validation("invalid search_notes cursor mode"))
+        .and_then(SearchMode::from_cursor_value)?;
+    let rank_key = payload.last_values[1]
+        .as_i64()
+        .ok_or_else(|| ToolError::validation("invalid search_notes cursor rank_key"))?;
+    if rank_key < 0 || (mode == SearchMode::IlikeFallback && rank_key != 0) {
+        return Err(ToolError::validation(
+            "invalid search_notes cursor rank_key",
+        ));
+    }
+    let updated_time = payload.last_values[2]
         .as_i64()
         .ok_or_else(|| ToolError::validation("invalid search_notes cursor updated_time"))?;
-    let joplin_id = payload.last_values[2]
+    let joplin_id = payload.last_values[3]
         .as_str()
         .ok_or_else(|| ToolError::validation("invalid search_notes cursor joplin_id"))?;
-    Ok((rank, updated_time, joplin_id.to_string()))
+    Ok(SearchCursorValues {
+        mode,
+        rank_key,
+        updated_time,
+        joplin_id: joplin_id.to_string(),
+    })
 }
 
 fn encode_search_cursor(
     note: &SearchNoteItem,
+    mode: SearchMode,
     filter_hash: &str,
     signing_key: &[u8],
 ) -> Result<String, ToolError> {
@@ -1746,12 +1847,14 @@ fn encode_search_cursor(
             tool: "search_notes".to_string(),
             filter_hash: filter_hash.to_string(),
             sort_keys: vec![
-                "rank".to_string(),
+                "mode".to_string(),
+                "rank_key".to_string(),
                 "updated_time".to_string(),
                 "joplin_id".to_string(),
             ],
             last_values: vec![
-                json!(note.rank),
+                json!(mode.cursor_value()),
+                json!(note.rank_key),
                 json!(note.updated_time.unwrap_or(0)),
                 json!(note.joplin_id),
             ],
@@ -1759,6 +1862,14 @@ fn encode_search_cursor(
         },
         signing_key,
     )
+}
+
+fn search_notes_should_use_ilike_fallback(
+    after: Option<&SearchCursorValues>,
+    fts_rows_empty: bool,
+    query_char_count: usize,
+) -> bool {
+    after.is_none() && fts_rows_empty && query_char_count <= ILIKE_FALLBACK_MAX_QUERY_CHARS
 }
 
 fn decode_body_cursor(
@@ -2149,6 +2260,23 @@ enum SearchMode {
     IlikeFallback,
 }
 
+impl SearchMode {
+    fn cursor_value(self) -> &'static str {
+        match self {
+            Self::FullText => "fts",
+            Self::IlikeFallback => "ilike",
+        }
+    }
+
+    fn from_cursor_value(value: &str) -> Result<Self, ToolError> {
+        match value {
+            "fts" => Ok(Self::FullText),
+            "ilike" => Ok(Self::IlikeFallback),
+            _ => Err(ToolError::validation("invalid search_notes cursor mode")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, FromRow)]
 struct SearchNoteRow {
     joplin_id: String,
@@ -2157,6 +2285,7 @@ struct SearchNoteRow {
     updated_time: Option<i64>,
     body_text: Option<String>,
     rank: f32,
+    rank_key: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -2167,6 +2296,8 @@ struct SearchNoteItem {
     notebook_id: Option<String>,
     updated_time: Option<i64>,
     rank: f32,
+    #[serde(skip)]
+    rank_key: i64,
     preview: String,
     truncated: bool,
 }
@@ -2181,6 +2312,7 @@ impl SearchNoteItem {
             notebook_id: row.notebook_id,
             updated_time: row.updated_time,
             rank: row.rank,
+            rank_key: row.rank_key,
             preview: preview.value,
             truncated: preview.truncated,
         }
@@ -2207,9 +2339,16 @@ impl NoteBodyRow {
 struct NoteChange {
     #[serde(rename = "id")]
     joplin_id: String,
-    title: String,
+    title: Option<String>,
     notebook_id: Option<String>,
     updated_time: i64,
+    deleted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    item_type: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deleted_time: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
@@ -2376,6 +2515,57 @@ mod tests {
     }
 
     #[test]
+    fn search_fallback_starts_only_without_a_cursor() {
+        let fts_cursor = SearchCursorValues {
+            mode: SearchMode::FullText,
+            rank_key: 750_000_000,
+            updated_time: 1000,
+            joplin_id: VALID_ID.to_string(),
+        };
+        let ilike_cursor = SearchCursorValues {
+            mode: SearchMode::IlikeFallback,
+            rank_key: 0,
+            updated_time: 1000,
+            joplin_id: VALID_ID.to_string(),
+        };
+
+        assert!(search_notes_should_use_ilike_fallback(None, true, 10));
+        assert!(!search_notes_should_use_ilike_fallback(
+            Some(&fts_cursor),
+            true,
+            10
+        ));
+        assert!(!search_notes_should_use_ilike_fallback(
+            Some(&ilike_cursor),
+            true,
+            10
+        ));
+        assert!(!search_notes_should_use_ilike_fallback(None, false, 10));
+        assert!(!search_notes_should_use_ilike_fallback(
+            None,
+            true,
+            ILIKE_FALLBACK_MAX_QUERY_CHARS + 1
+        ));
+    }
+
+    #[test]
+    fn search_fts_query_computes_rank_once_and_keysets_on_rank_key() {
+        assert_eq!(FULL_TEXT_SEARCH_QUERY.matches("ts_rank(").count(), 1);
+        assert!(FULL_TEXT_SEARCH_QUERY.contains("rank_key < $9"));
+        assert!(FULL_TEXT_SEARCH_QUERY.contains("rank_key = $9"));
+        assert!(!FULL_TEXT_SEARCH_QUERY.contains("$9::real"));
+    }
+
+    #[test]
+    fn get_changes_since_query_unions_deleted_item_tombstones() {
+        assert!(CHANGES_SINCE_QUERY.contains("joplin_mcp.deleted_items_index"));
+        assert!(CHANGES_SINCE_QUERY.contains("UNION ALL"));
+        assert!(CHANGES_SINCE_QUERY.contains("true AS deleted"));
+        assert!(CHANGES_SINCE_QUERY.contains("deleted.deleted_time"));
+        assert!(CHANGES_SINCE_QUERY.contains("deleted.tombstoned_at"));
+    }
+
+    #[test]
     fn tag_and_notebook_queries_filter_deleted_notes() {
         let source = include_str!("tools.rs");
 
@@ -2509,17 +2699,32 @@ mod tests {
             tool: "search_notes".to_string(),
             filter_hash: filters.clone(),
             sort_keys: vec![
-                "rank".to_string(),
+                "mode".to_string(),
+                "rank_key".to_string(),
                 "updated_time".to_string(),
                 "joplin_id".to_string(),
             ],
-            last_values: vec![json!(0.75), json!(1000), json!(VALID_ID)],
+            last_values: vec![
+                json!("fts"),
+                json!(750_000_000),
+                json!(1000),
+                json!(VALID_ID),
+            ],
             body: None,
         };
         let cursor = encode_cursor(&payload, CURSOR_KEY).expect("cursor encoded");
         let decoded =
             decode_cursor(&cursor, CURSOR_KEY, "search_notes", &filters).expect("cursor decoded");
         assert_eq!(decoded, payload);
+        assert_eq!(
+            search_cursor_values(&decoded).expect("search cursor values"),
+            SearchCursorValues {
+                mode: SearchMode::FullText,
+                rank_key: 750_000_000,
+                updated_time: 1000,
+                joplin_id: VALID_ID.to_string(),
+            }
+        );
 
         let wrong_tool = decode_cursor(&cursor, CURSOR_KEY, "list_notes", &filters)
             .expect_err("wrong tool rejected");
@@ -2532,6 +2737,59 @@ mod tests {
         let invalid = decode_cursor("not-a-cursor", CURSOR_KEY, "search_notes", &filters)
             .expect_err("invalid cursor rejected");
         assert_eq!(invalid.code, ErrorCode::Validation);
+    }
+
+    #[test]
+    fn search_cursor_rejects_legacy_float_rank_payload() {
+        let payload = CursorPayload {
+            version: CURSOR_VERSION,
+            tool: "search_notes".to_string(),
+            filter_hash: filter_hash(&json!({"query": "hello"})),
+            sort_keys: vec![
+                "rank".to_string(),
+                "updated_time".to_string(),
+                "joplin_id".to_string(),
+            ],
+            last_values: vec![json!(0.75), json!(1000), json!(VALID_ID)],
+            body: None,
+        };
+
+        let error = search_cursor_values(&payload).expect_err("legacy cursor rejected");
+        assert!(error.message.contains("stale search_notes cursor"));
+    }
+
+    #[test]
+    fn encode_search_cursor_records_mode_and_integer_rank_key() {
+        let filters = filter_hash(&json!({"query": "hello"}));
+        let note = SearchNoteItem {
+            joplin_id: VALID_ID.to_string(),
+            title: "Result".to_string(),
+            notebook_id: None,
+            updated_time: Some(1000),
+            rank: 0.75,
+            rank_key: 750_000_000,
+            preview: "Result body".to_string(),
+            truncated: false,
+        };
+
+        let cursor = encode_search_cursor(&note, SearchMode::FullText, &filters, CURSOR_KEY)
+            .expect("cursor encoded");
+        let payload =
+            decode_cursor(&cursor, CURSOR_KEY, "search_notes", &filters).expect("cursor decoded");
+
+        assert_eq!(
+            payload.sort_keys,
+            ["mode", "rank_key", "updated_time", "joplin_id"]
+        );
+        assert_eq!(
+            search_cursor_values(&payload).expect("search cursor values"),
+            SearchCursorValues {
+                mode: SearchMode::FullText,
+                rank_key: 750_000_000,
+                updated_time: 1000,
+                joplin_id: VALID_ID.to_string(),
+            }
+        );
     }
 
     #[test]
@@ -2656,9 +2914,13 @@ mod tests {
     fn get_changes_since_cursor_uses_updated_time_asc_and_joplin_id_asc_keys() {
         let note = NoteChange {
             joplin_id: VALID_ID.to_string(),
-            title: "Changed".to_string(),
+            title: Some("Changed".to_string()),
             notebook_id: None,
             updated_time: 1234,
+            deleted: false,
+            item_type: None,
+            source: None,
+            deleted_time: None,
         };
         let filters = filter_hash(&json!({"since": 1000}));
         let cursor =

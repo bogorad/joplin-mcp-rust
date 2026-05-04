@@ -36,7 +36,7 @@ const CHANGED_ITEMS_QUERY: &str = r#"
         jop_encryption_applied
     FROM items
     WHERE owner_id = $1
-      AND ($2::bigint IS NULL OR updated_time > $2)
+      AND ($2::bigint IS NULL OR updated_time >= $2)
       AND jop_type IN (1, 2, 5, 6, 9)
     ORDER BY updated_time ASC, id ASC
 "#;
@@ -56,7 +56,7 @@ const CHANGED_ITEMS_BATCH_QUERY: &str = r#"
         jop_encryption_applied
     FROM items
     WHERE owner_id = $1
-      AND ($2::bigint IS NULL OR updated_time > $2)
+      AND ($2::bigint IS NULL OR updated_time >= $2)
       AND ($3::bigint IS NULL OR updated_time > $3 OR (updated_time = $3 AND id > $4))
       AND jop_type IN (1, 2, 5, 6, 9)
     ORDER BY updated_time ASC, id ASC
@@ -398,13 +398,14 @@ mod tests {
     }
 
     #[test]
-    fn changed_items_query_supports_optional_since_filter() {
-        assert!(CHANGED_ITEMS_QUERY.contains("$2::bigint IS NULL OR updated_time > $2"));
+    fn changed_items_query_supports_optional_inclusive_since_filter() {
+        assert!(CHANGED_ITEMS_QUERY.contains("$2::bigint IS NULL OR updated_time >= $2"));
         assert!(CHANGED_ITEMS_QUERY.contains("ORDER BY updated_time ASC, id ASC"));
     }
 
     #[test]
-    fn changed_items_batch_query_uses_keyset_cursor_and_limit() {
+    fn changed_items_batch_query_uses_inclusive_since_keyset_cursor_and_limit() {
+        assert!(CHANGED_ITEMS_BATCH_QUERY.contains("updated_time >= $2"));
         assert!(CHANGED_ITEMS_BATCH_QUERY.contains("updated_time > $3"));
         assert!(CHANGED_ITEMS_BATCH_QUERY.contains("updated_time = $3 AND id > $4"));
         assert!(CHANGED_ITEMS_BATCH_QUERY.contains("ORDER BY updated_time ASC, id ASC"));
@@ -481,7 +482,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_changed_item_batch_uses_cursor_and_limit() {
+    async fn default_changed_item_batch_uses_inclusive_since_cursor_and_limit() {
         #[derive(Debug)]
         struct MemorySource {
             items: Vec<JoplinItem>,
@@ -497,7 +498,7 @@ mod tests {
                 Ok(self
                     .items
                     .iter()
-                    .filter(|item| since.is_none_or(|since| item.updated_time > since))
+                    .filter(|item| since.is_none_or(|since| item.updated_time >= since))
                     .cloned()
                     .collect())
             }
@@ -527,12 +528,12 @@ mod tests {
         };
 
         let first = source
-            .changed_items_batch("owner", Some(10), None, 2)
+            .changed_items_batch("owner", Some(11), None, 2)
             .await
             .expect("first batch");
         let cursor = JoplinItemCursor::from(first.last().expect("cursor item"));
         let second = source
-            .changed_items_batch("owner", Some(10), Some(&cursor), 2)
+            .changed_items_batch("owner", Some(11), Some(&cursor), 2)
             .await
             .expect("second batch");
 
@@ -549,6 +550,76 @@ mod tests {
                 .map(|item| item.id.as_str())
                 .collect::<Vec<_>>(),
             ["server-c"]
+        );
+    }
+
+    #[tokio::test]
+    async fn default_changed_item_batch_rechecks_same_timestamp_boundary() {
+        #[derive(Debug)]
+        struct MemorySource {
+            items: Vec<JoplinItem>,
+        }
+
+        #[async_trait]
+        impl JoplinSource for MemorySource {
+            async fn changed_items_since(
+                &self,
+                _user_id: &str,
+                since: Option<i64>,
+            ) -> anyhow::Result<Vec<JoplinItem>> {
+                Ok(self
+                    .items
+                    .iter()
+                    .filter(|item| since.is_none_or(|since| item.updated_time >= since))
+                    .cloned()
+                    .collect())
+            }
+
+            async fn item_by_id(
+                &self,
+                _user_id: &str,
+                _item_id: &str,
+            ) -> anyhow::Result<Option<JoplinItem>> {
+                Ok(None)
+            }
+
+            async fn source_watermarks(
+                &self,
+                _user_ids: &[String],
+            ) -> anyhow::Result<Vec<JoplinSourceWatermark>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let first_source = MemorySource {
+            items: vec![item("server-a", 20)],
+        };
+        let first = first_source
+            .changed_items_batch("owner", Some(20), None, 10)
+            .await
+            .expect("first batch");
+
+        let second_source = MemorySource {
+            items: vec![item("server-a", 20), item("server-b", 20)],
+        };
+        let second = second_source
+            .changed_items_batch("owner", Some(20), None, 10)
+            .await
+            .expect("second batch");
+
+        assert_eq!(
+            first
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["server-a"]
+        );
+        assert_eq!(
+            second
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["server-a", "server-b"]
         );
     }
 

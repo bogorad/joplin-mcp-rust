@@ -151,6 +151,7 @@ struct ActiveRow {
 struct DeletedRow {
     joplin_id: String,
     item_type: JoplinItemType,
+    updated_time: i64,
     deleted_time: Option<i64>,
     note_joplin_id: Option<String>,
     tag_joplin_id: Option<String>,
@@ -253,7 +254,9 @@ pub fn refresh_needed(
     }
 
     match (source_watermark, user.last_seen_joplin_updated_time) {
-        (Some(source_watermark), Some(last_seen)) => source_watermark > last_seen,
+        // The persisted watermark is timestamp-only. Recheck equal timestamps so
+        // later same-millisecond Joplin rows are not skipped forever.
+        (Some(source_watermark), Some(last_seen)) => source_watermark >= last_seen,
         (Some(_), None) => true,
         (None, None) => false,
         (None, Some(_)) => false,
@@ -389,17 +392,31 @@ where
 
         let batch_len = changed.len();
         after = changed.last().map(JoplinItemCursor::from);
-        totals.changed_items += batch_len;
         let rows = build_incremental_rows(&user.joplin_user_id, changed);
         async {
+            let replay_boundary = user.last_seen_joplin_updated_time;
+            let mut applied_rows = 0;
             for row in &rows.deleted {
+                if replay_boundary == Some(row.updated_time)
+                    && deleted_row_is_current(tx, user.mcp_user_id, row, "deleted_time").await?
+                {
+                    continue;
+                }
                 purge_active_row(tx, user.mcp_user_id, row).await?;
                 upsert_deleted_row(tx, user.mcp_user_id, row, "deleted_time").await?;
+                applied_rows += 1;
             }
             for row in &rows.active {
+                if replay_boundary == Some(row.updated_time)
+                    && active_row_is_current(tx, user.mcp_user_id, row).await?
+                {
+                    continue;
+                }
                 purge_active_item(tx, user.mcp_user_id, &row.joplin_id, row.item_type).await?;
                 upsert_active_row(tx, user.mcp_user_id, row).await?;
+                applied_rows += 1;
             }
+            totals.changed_items += applied_rows;
             anyhow::Ok(())
         }
         .instrument(tracing::info_span!("index.row_upserts"))
@@ -480,6 +497,7 @@ fn build_incremental_rows(joplin_user_id: &str, items: Vec<JoplinItem>) -> Incre
             rows.deleted.push(DeletedRow {
                 joplin_id: item.jop_id,
                 item_type: item.item_type,
+                updated_time: item.updated_time,
                 deleted_time: Some(deleted_time),
                 note_joplin_id: string_metadata(&parsed, "note_id"),
                 tag_joplin_id: string_metadata(&parsed, "tag_id"),
@@ -740,6 +758,143 @@ async fn record_incremental_failure(
     Ok(())
 }
 
+async fn active_row_is_current(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+    row: &ActiveRow,
+) -> anyhow::Result<bool> {
+    let query = match row.item_type {
+        JoplinItemType::Note => sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM joplin_mcp.notes_index
+                WHERE user_id = $1
+                  AND joplin_id = $2
+                  AND joplin_item_id = $3
+                  AND parent_joplin_id IS NOT DISTINCT FROM $4
+                  AND title = $5
+                  AND body_text = $6
+                  AND is_todo = $7
+                  AND created_time IS NOT DISTINCT FROM $8
+                  AND updated_time IS NOT DISTINCT FROM $9
+                  AND deleted_time IS NULL
+                  AND resource_refs = $10
+            )
+            "#,
+        )
+        .bind(user_id)
+        .bind(&row.joplin_id)
+        .bind(&row.joplin_item_id)
+        .bind(&row.parent_joplin_id)
+        .bind(&row.title)
+        .bind(&row.body_text)
+        .bind(row.is_todo)
+        .bind(row.created_time)
+        .bind(row.updated_time)
+        .bind(&row.resource_refs)
+        .fetch_one(tx.as_mut())
+        .await
+        .context("check current note index row")?,
+        JoplinItemType::Folder => sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM joplin_mcp.notebooks_index
+                WHERE user_id = $1
+                  AND joplin_id = $2
+                  AND joplin_item_id = $3
+                  AND parent_joplin_id IS NOT DISTINCT FROM $4
+                  AND title = $5
+                  AND created_time IS NOT DISTINCT FROM $6
+                  AND updated_time IS NOT DISTINCT FROM $7
+                  AND deleted_time IS NULL
+            )
+            "#,
+        )
+        .bind(user_id)
+        .bind(&row.joplin_id)
+        .bind(&row.joplin_item_id)
+        .bind(&row.parent_joplin_id)
+        .bind(&row.title)
+        .bind(row.created_time)
+        .bind(row.updated_time)
+        .fetch_one(tx.as_mut())
+        .await
+        .context("check current notebook index row")?,
+        JoplinItemType::Tag => sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM joplin_mcp.tags_index
+                WHERE user_id = $1
+                  AND joplin_id = $2
+                  AND joplin_item_id = $3
+                  AND title = $4
+                  AND updated_time IS NOT DISTINCT FROM $5
+            )
+            "#,
+        )
+        .bind(user_id)
+        .bind(&row.joplin_id)
+        .bind(&row.joplin_item_id)
+        .bind(&row.title)
+        .bind(row.updated_time)
+        .fetch_one(tx.as_mut())
+        .await
+        .context("check current tag index row")?,
+        JoplinItemType::NoteTag => sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM joplin_mcp.note_tags_index
+                WHERE user_id = $1
+                  AND note_joplin_id = $2
+                  AND tag_joplin_id = $3
+                  AND updated_time IS NOT DISTINCT FROM $4
+            )
+            "#,
+        )
+        .bind(user_id)
+        .bind(row.note_joplin_id.as_ref().expect("validated note id"))
+        .bind(row.tag_joplin_id.as_ref().expect("validated tag id"))
+        .bind(row.updated_time)
+        .fetch_one(tx.as_mut())
+        .await
+        .context("check current note tag index row")?,
+        JoplinItemType::Resource => sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM joplin_mcp.resources_index
+                WHERE user_id = $1
+                  AND joplin_id = $2
+                  AND joplin_item_id = $3
+                  AND title = $4
+                  AND mime IS NOT DISTINCT FROM $5
+                  AND size_bytes IS NOT DISTINCT FROM $6
+                  AND file_extension IS NOT DISTINCT FROM $7
+                  AND updated_time IS NOT DISTINCT FROM $8
+            )
+            "#,
+        )
+        .bind(user_id)
+        .bind(&row.joplin_id)
+        .bind(&row.joplin_item_id)
+        .bind(&row.title)
+        .bind(&row.mime)
+        .bind(row.size_bytes)
+        .bind(&row.file_extension)
+        .bind(row.updated_time)
+        .fetch_one(tx.as_mut())
+        .await
+        .context("check current resource index row")?,
+        JoplinItemType::Revision => true,
+    };
+
+    Ok(query)
+}
+
 async fn upsert_active_row(
     tx: &mut Transaction<'_, Postgres>,
     user_id: Uuid,
@@ -869,6 +1024,35 @@ async fn upsert_active_row(
     };
 
     Ok(())
+}
+
+async fn deleted_row_is_current(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+    row: &DeletedRow,
+    source: &str,
+) -> anyhow::Result<bool> {
+    sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM joplin_mcp.deleted_items_index
+            WHERE user_id = $1
+              AND joplin_id = $2
+              AND item_type IS NOT DISTINCT FROM $3
+              AND source = $4
+              AND deleted_time IS NOT DISTINCT FROM $5
+        )
+        "#,
+    )
+    .bind(user_id)
+    .bind(&row.joplin_id)
+    .bind(row.item_type as i32)
+    .bind(source)
+    .bind(row.deleted_time)
+    .fetch_one(tx.as_mut())
+    .await
+    .context("check current deleted item index row")
 }
 
 async fn purge_active_row(
@@ -1016,6 +1200,7 @@ where
         let row = DeletedRow {
             joplin_id: item.joplin_id,
             item_type,
+            updated_time: 0,
             deleted_time: None,
             note_joplin_id: None,
             tag_joplin_id: None,
@@ -1082,7 +1267,7 @@ fn refresh_gap_seconds(last_incremental_at: Option<DateTime<Utc>>) -> u64 {
 }
 
 fn is_stale(last_incremental_at: Option<DateTime<Utc>>, refresh_interval_seconds: u64) -> bool {
-    refresh_gap_seconds(last_incremental_at) > refresh_interval_seconds.saturating_mul(2)
+    refresh_gap_seconds(last_incremental_at) >= refresh_interval_seconds.saturating_mul(2)
 }
 
 fn joplin_lag_seconds(last_seen_joplin_updated_time: Option<i64>) -> Option<f64> {
@@ -1091,9 +1276,13 @@ fn joplin_lag_seconds(last_seen_joplin_updated_time: Option<i64>) -> Option<f64>
 }
 
 fn advisory_lock_key(user_id: Uuid) -> i64 {
-    let mut bytes = [0; 8];
-    bytes.copy_from_slice(&user_id.as_bytes()[0..8]);
-    i64::from_be_bytes(bytes)
+    let hash = user_id
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        });
+    i64::from_be_bytes(hash.to_be_bytes())
 }
 
 fn parent_id(item: &JoplinItem, parsed: &ParsedItem) -> Option<String> {
@@ -1211,15 +1400,19 @@ mod tests {
     #[test]
     fn stale_state_uses_twice_refresh_interval() {
         assert!(is_stale(Some(Utc::now() - Duration::seconds(121)), 60));
-        assert!(!is_stale(Some(Utc::now() - Duration::seconds(120)), 60));
+        assert!(is_stale(Some(Utc::now() - Duration::seconds(120)), 60));
+        assert!(!is_stale(Some(Utc::now() - Duration::seconds(119)), 60));
         assert!(is_stale(None, 60));
     }
 
     #[test]
-    fn advisory_lock_key_is_stable_per_user() {
-        let user_id = Uuid::parse_str("00000000-0000-0001-8000-000000000000").expect("uuid");
-        assert_eq!(advisory_lock_key(user_id), 1);
-        assert_eq!(advisory_lock_key(user_id), advisory_lock_key(user_id));
+    fn advisory_lock_key_hashes_full_uuid() {
+        let first = Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").expect("uuid");
+        let second = Uuid::parse_str("00112233-4455-6677-8899-aabbccddee00").expect("uuid");
+
+        assert_eq!(&first.as_bytes()[0..8], &second.as_bytes()[0..8]);
+        assert_eq!(advisory_lock_key(first), advisory_lock_key(first));
+        assert_ne!(advisory_lock_key(first), advisory_lock_key(second));
     }
 
     #[test]
@@ -1416,7 +1609,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_needed_uses_source_watermark_without_forcing_no_change_apply() {
+    fn refresh_needed_rechecks_equal_source_watermark_boundary() {
         let config = IndexConfig::default();
         let user = RefreshUser {
             mcp_user_id: Uuid::new_v4(),
@@ -1429,7 +1622,8 @@ mod tests {
             last_seen_joplin_updated_time: Some(10),
         };
 
-        assert!(!refresh_needed(&user, Some(10), &config));
+        assert!(!refresh_needed(&user, Some(9), &config));
+        assert!(refresh_needed(&user, Some(10), &config));
         assert!(refresh_needed(&user, Some(11), &config));
     }
 
@@ -1447,12 +1641,12 @@ mod tests {
             last_seen_joplin_updated_time: Some(10),
         };
 
-        assert!(!refresh_needed(&user, Some(10), &config));
+        assert!(!refresh_needed(&user, Some(9), &config));
         user.last_reconciled_at =
             Some(Utc::now() - Duration::hours(config.hard_delete_reconcile_interval_hours as i64));
-        assert!(refresh_needed(&user, Some(10), &config));
+        assert!(refresh_needed(&user, Some(9), &config));
         user.last_reconciled_at = None;
-        assert!(refresh_needed(&user, Some(10), &config));
+        assert!(refresh_needed(&user, Some(9), &config));
     }
 
     #[test]

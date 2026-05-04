@@ -184,7 +184,7 @@ impl fmt::Display for MissingLogs<'_> {
 mod tests {
     use super::*;
     use std::sync::{
-        Arc,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
     };
     use tokio::{
@@ -193,8 +193,16 @@ mod tests {
         sync::oneshot,
     };
 
+    fn live_joplin_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("live Joplin env lock")
+    }
+
     #[test]
     fn selects_local_endpoint_by_default() {
+        let _guard = live_joplin_env_lock();
         unsafe {
             env::remove_var("JP_MCP_LIVE_JOPLIN");
         }
@@ -214,15 +222,12 @@ mod tests {
 
     #[test]
     fn selects_live_endpoint_for_real_joplin_tests() {
+        let _guard = live_joplin_env_lock();
         unsafe {
             env::set_var("JP_MCP_LIVE_JOPLIN", "1");
         }
 
         let harness = VictoriaLogsHarness::from_env().expect("harness");
-
-        unsafe {
-            env::remove_var("JP_MCP_LIVE_JOPLIN");
-        }
         assert_eq!(harness.base_url().as_str(), "http://victorialogs.lan:9428/");
         assert_eq!(
             harness.otlp_logs_url().expect("otlp url").as_str(),
@@ -232,6 +237,10 @@ mod tests {
             harness.query_url().expect("query url").as_str(),
             "http://victorialogs.lan:9428/select/logsql/query"
         );
+
+        unsafe {
+            env::remove_var("JP_MCP_LIVE_JOPLIN");
+        }
     }
 
     #[test]

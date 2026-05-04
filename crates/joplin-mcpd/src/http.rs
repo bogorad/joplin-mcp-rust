@@ -13,7 +13,10 @@ use crate::{
         pool as db_pool,
     },
     indexer::refresh::request_index_refresh_now,
-    lifecycle::{Readiness, ReadinessStatus, RemoteIp, ShutdownDrain, extract_client_ip},
+    lifecycle::{
+        Readiness, ReadinessStatus, RemoteIp, ShutdownDrain, extract_client_ip,
+        should_log_slow_request,
+    },
     mcp::transport::{McpAuth, mcp_delete, mcp_get, mcp_post},
     observability::{
         metrics,
@@ -117,7 +120,10 @@ fn router_from_state(state: AppState) -> Router {
             state.clone(),
             attach_remote_ip,
         ))
-        .layer(middleware::from_fn(attach_request_context))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            attach_request_context,
+        ))
         .with_state(state)
 }
 
@@ -305,6 +311,7 @@ struct IndexStatusRow {
 
 const BOOTSTRAP_RATE_LIMIT_MAX_IP_KEYS: usize = 4096;
 const BOOTSTRAP_RATE_LIMIT_MAX_EMAIL_KEYS: usize = 16_384;
+const BOOTSTRAP_RATE_LIMIT_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Default)]
 struct BootstrapRateLimiter {
@@ -315,6 +322,8 @@ struct BootstrapRateLimiter {
 struct BootstrapRateLimitState {
     per_ip: BTreeMap<String, WindowCounter>,
     per_email: BTreeMap<String, WindowCounter>,
+    next_ip_prune_at: Option<Instant>,
+    next_email_prune_at: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -347,7 +356,7 @@ impl BootstrapRateLimiter {
     ) -> Result<(), BootstrapRateLimitRejection> {
         let now = Instant::now();
         let ip_key = remote_ip.unwrap_or("unknown").to_string();
-        let email_key = email.trim().to_ascii_lowercase();
+        let email_key = bootstrap_email_key(email);
         let mut state = self.inner.lock().expect("bootstrap rate limiter lock");
 
         if !allow_ip_window(&mut state, ip_key, now, config) {
@@ -356,14 +365,7 @@ impl BootstrapRateLimiter {
             });
         }
 
-        if !allow_windowed_request(
-            &mut state.per_email,
-            email_key,
-            now,
-            Duration::from_secs(60 * 60),
-            config.per_email_per_hour,
-            BOOTSTRAP_RATE_LIMIT_MAX_EMAIL_KEYS,
-        ) {
+        if !allow_email_window(&mut state, email_key, now, config) {
             return Err(BootstrapRateLimitRejection {
                 scope: BootstrapRateLimitScope::Email,
             });
@@ -408,6 +410,7 @@ fn allow_ip_window(
 ) -> bool {
     allow_windowed_request(
         &mut state.per_ip,
+        &mut state.next_ip_prune_at,
         ip_key,
         now,
         Duration::from_secs(60),
@@ -416,8 +419,34 @@ fn allow_ip_window(
     )
 }
 
+fn allow_email_window(
+    state: &mut BootstrapRateLimitState,
+    email_key: String,
+    now: Instant,
+    config: &BootstrapRateLimitConfig,
+) -> bool {
+    allow_windowed_request(
+        &mut state.per_email,
+        &mut state.next_email_prune_at,
+        email_key,
+        now,
+        Duration::from_secs(60 * 60),
+        config.per_email_per_hour,
+        BOOTSTRAP_RATE_LIMIT_MAX_EMAIL_KEYS,
+    )
+}
+
+fn bootstrap_email_key(email: &str) -> String {
+    email
+        .trim()
+        .chars()
+        .flat_map(|character| character.to_lowercase())
+        .collect()
+}
+
 fn allow_windowed_request(
     counters: &mut BTreeMap<String, WindowCounter>,
+    next_prune_at: &mut Option<Instant>,
     key: String,
     now: Instant,
     window: Duration,
@@ -428,20 +457,45 @@ fn allow_windowed_request(
         return false;
     }
 
-    counters.retain(|_, counter| now.duration_since(counter.window_start) < window);
+    prune_windowed_counters(counters, next_prune_at, now, window, false);
     if !counters.contains_key(&key) && counters.len() >= max_keys {
-        return false;
+        prune_windowed_counters(counters, next_prune_at, now, window, true);
+        if !counters.contains_key(&key) && counters.len() >= max_keys {
+            return false;
+        }
     }
 
     let counter = counters.entry(key).or_insert(WindowCounter {
         window_start: now,
         count: 0,
     });
+    if now.saturating_duration_since(counter.window_start) >= window {
+        counter.window_start = now;
+        counter.count = 0;
+    }
     if counter.count >= limit {
         return false;
     }
     counter.count += 1;
     true
+}
+
+fn prune_windowed_counters(
+    counters: &mut BTreeMap<String, WindowCounter>,
+    next_prune_at: &mut Option<Instant>,
+    now: Instant,
+    window: Duration,
+    force: bool,
+) {
+    if !force
+        && let Some(prune_at) = next_prune_at.as_ref()
+        && now < *prune_at
+    {
+        return;
+    }
+
+    counters.retain(|_, counter| now.saturating_duration_since(counter.window_start) < window);
+    *next_prune_at = Some(now + BOOTSTRAP_RATE_LIMIT_PRUNE_INTERVAL);
 }
 
 async fn bootstrap_login(
@@ -972,7 +1026,12 @@ async fn attach_remote_ip(
     }
 }
 
-async fn attach_request_context(mut request: AxumRequest<Body>, next: Next) -> Response {
+async fn attach_request_context(
+    State(state): State<AppState>,
+    mut request: AxumRequest<Body>,
+    next: Next,
+) -> Response {
+    let started = Instant::now();
     let test_id = request
         .headers()
         .get(TEST_ID_HEADER)
@@ -996,17 +1055,53 @@ async fn attach_request_context(mut request: AxumRequest<Body>, next: Next) -> R
     );
 
     let response = next.run(request).await;
+    let elapsed = started.elapsed();
+    let elapsed_ms = duration_millis(elapsed);
+    let status = response.status().as_u16();
+    let slow_threshold_ms = state.config.server.slow_request_log_threshold_ms;
     tracing::info!(
         request.id = %request_id,
         test.id = test_id.as_deref().unwrap_or(""),
         http.request.method = %method,
         url.path = %path,
-        http.response.status_code = response.status().as_u16(),
+        http.response.status_code = status,
+        http.request.duration_ms = elapsed_ms,
         operation = "http_request",
         outcome = "completed",
         "request completed"
     );
+    if should_log_configured_slow_request(started, &state.config) {
+        tracing::warn!(
+            request.id = %request_id,
+            test.id = test_id.as_deref().unwrap_or(""),
+            http.request.method = %method,
+            url.path = %path,
+            http.response.status_code = status,
+            http.request.duration_ms = elapsed_ms,
+            server.slow_request_log_threshold_ms = slow_threshold_ms,
+            operation = "http_request",
+            outcome = "slow",
+            "slow request completed"
+        );
+    }
     response
+}
+
+fn should_log_configured_slow_request(started: Instant, config: &Config) -> bool {
+    should_log_slow_request(started, request_slow_log_threshold(config))
+}
+
+fn request_slow_log_threshold(config: &Config) -> Duration {
+    Duration::from_millis(config.server.slow_request_log_threshold_ms)
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    let millis = duration.as_millis();
+    if millis > u128::from(u64::MAX) {
+        u64::MAX
+    } else {
+        millis as u64
+    }
 }
 
 async fn enforce_origin_policy(
@@ -1374,6 +1469,58 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
+    #[tokio::test]
+    async fn mcp_rejects_non_post_unexpected_origin_before_method_handler() {
+        let app = router(Config::default(), Readiness::new(ReadinessStatus::Ready));
+
+        let response = app
+            .oneshot(
+                Request::get("/mcp")
+                    .header("origin", "https://evil.test")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn mcp_rejects_non_post_missing_browser_origin_before_method_handler() {
+        let app = router(Config::default(), Readiness::new(ReadinessStatus::Ready));
+
+        let response = app
+            .oneshot(
+                Request::delete("/mcp")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn request_slow_log_decision_honors_configured_threshold() {
+        let mut config = Config::default();
+        config.server.slow_request_log_threshold_ms = 1000;
+
+        assert_eq!(
+            request_slow_log_threshold(&config),
+            Duration::from_millis(1000)
+        );
+        assert!(!should_log_configured_slow_request(
+            Instant::now() - Duration::from_millis(100),
+            &config
+        ));
+        assert!(should_log_configured_slow_request(
+            Instant::now() - Duration::from_millis(1500),
+            &config
+        ));
+    }
+
     #[test]
     fn bootstrap_login_requests_index_wake_up_after_token_mint() {
         let source = include_str!("http.rs");
@@ -1454,6 +1601,39 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_email_key_unicode_lowercases_without_changing_submitted_email() {
+        let submitted = String::from(" MÜLLER@Example.Test ");
+
+        assert_eq!(bootstrap_email_key(&submitted), "müller@example.test");
+        assert_eq!(submitted, " MÜLLER@Example.Test ");
+    }
+
+    #[test]
+    fn bootstrap_rate_limiter_rejects_unicode_email_case_variants() {
+        let limiter = BootstrapRateLimiter::new();
+        let config = BootstrapRateLimitConfig {
+            per_ip_per_minute: 10,
+            per_email_per_hour: 2,
+        };
+
+        assert!(
+            limiter
+                .check(Some("192.0.2.30"), "MÜLLER@Example.Test", &config)
+                .is_ok()
+        );
+        assert!(
+            limiter
+                .check(Some("192.0.2.31"), " müller@example.test ", &config)
+                .is_ok()
+        );
+
+        let rejection = limiter
+            .check(Some("192.0.2.32"), "Müller@example.test", &config)
+            .expect_err("third Unicode case variant is rejected");
+        assert_eq!(rejection.scope, BootstrapRateLimitScope::Email);
+    }
+
+    #[test]
     fn bootstrap_rate_limiter_resets_expired_windows_by_pruning_keys() {
         let limiter = BootstrapRateLimiter::new();
         let config = BootstrapRateLimitConfig {
@@ -1498,9 +1678,81 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_rate_limiter_prunes_stale_keys_on_cadence() {
+        let now = Instant::now();
+        let stale_start = now - Duration::from_secs(120);
+        let mut counters = BTreeMap::new();
+        let mut next_prune_at = Some(now + Duration::from_secs(30));
+        counters.insert(
+            "stale".to_string(),
+            WindowCounter {
+                window_start: stale_start,
+                count: 1,
+            },
+        );
+
+        assert!(allow_windowed_request(
+            &mut counters,
+            &mut next_prune_at,
+            "fresh".to_string(),
+            now,
+            Duration::from_secs(60),
+            10,
+            10,
+        ));
+        assert!(counters.contains_key("stale"));
+
+        assert!(allow_windowed_request(
+            &mut counters,
+            &mut next_prune_at,
+            "fresh-two".to_string(),
+            now + Duration::from_secs(31),
+            Duration::from_secs(60),
+            10,
+            10,
+        ));
+        assert!(!counters.contains_key("stale"));
+    }
+
+    #[test]
+    fn bootstrap_rate_limiter_prunes_stale_keys_when_key_cap_is_full() {
+        let now = Instant::now();
+        let stale_start = now - Duration::from_secs(120);
+        let mut counters = BTreeMap::new();
+        let mut next_prune_at = Some(now + Duration::from_secs(30));
+        counters.insert(
+            "stale-one".to_string(),
+            WindowCounter {
+                window_start: stale_start,
+                count: 1,
+            },
+        );
+        counters.insert(
+            "stale-two".to_string(),
+            WindowCounter {
+                window_start: stale_start,
+                count: 1,
+            },
+        );
+
+        assert!(allow_windowed_request(
+            &mut counters,
+            &mut next_prune_at,
+            "fresh".to_string(),
+            now,
+            Duration::from_secs(60),
+            10,
+            2,
+        ));
+        assert_eq!(counters.len(), 1);
+        assert!(counters.contains_key("fresh"));
+    }
+
+    #[test]
     fn bootstrap_rate_limiter_rejects_new_keys_when_active_window_is_full() {
         let now = Instant::now();
         let mut counters = BTreeMap::new();
+        let mut next_prune_at = Some(now + Duration::from_secs(60));
         counters.insert(
             "one".to_string(),
             WindowCounter {
@@ -1518,6 +1770,7 @@ mod tests {
 
         assert!(!allow_windowed_request(
             &mut counters,
+            &mut next_prune_at,
             "three".to_string(),
             now,
             Duration::from_secs(60),
@@ -1527,6 +1780,7 @@ mod tests {
         assert_eq!(counters.len(), 2);
         assert!(allow_windowed_request(
             &mut counters,
+            &mut next_prune_at,
             "one".to_string(),
             now,
             Duration::from_secs(60),
@@ -1669,12 +1923,18 @@ mod tests {
 
         let get_response = app
             .clone()
-            .oneshot(Request::get("/mcp").body(Body::empty()).expect("request"))
+            .oneshot(
+                Request::get("/mcp")
+                    .header("origin", "http://127.0.0.1:8081")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
             .await
             .expect("response");
         let delete_response = app
             .oneshot(
                 Request::delete("/mcp")
+                    .header("origin", "http://127.0.0.1:8081")
                     .body(Body::empty())
                     .expect("request"),
             )

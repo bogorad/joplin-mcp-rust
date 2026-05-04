@@ -71,7 +71,7 @@ pub fn is_localhost_listener(listen: SocketAddr) -> bool {
 
 pub fn endpoint_class(method: &Method, path: &str) -> Option<EndpointClass> {
     match (method, path) {
-        (&Method::POST, "/mcp") => Some(EndpointClass::Mcp),
+        (_, "/mcp") => Some(EndpointClass::Mcp),
         (_, path) if path.starts_with("/api/") => Some(EndpointClass::Api),
         (&Method::GET, "/login") => Some(EndpointClass::LoginGet),
         (&Method::POST, "/login") => Some(EndpointClass::LoginPost),
@@ -361,6 +361,18 @@ mod tests {
     fn endpoint_classes_cover_browser_reachable_paths() {
         assert_eq!(
             endpoint_class(&Method::POST, "/mcp"),
+            Some(EndpointClass::Mcp)
+        );
+        assert_eq!(
+            endpoint_class(&Method::GET, "/mcp"),
+            Some(EndpointClass::Mcp)
+        );
+        assert_eq!(
+            endpoint_class(&Method::OPTIONS, "/mcp"),
+            Some(EndpointClass::Mcp)
+        );
+        assert_eq!(
+            endpoint_class(&Method::DELETE, "/mcp"),
             Some(EndpointClass::Mcp)
         );
         assert_eq!(

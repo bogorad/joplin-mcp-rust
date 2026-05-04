@@ -798,7 +798,7 @@ Status transitions:
 empty    -> building when the first full build starts
 building -> ready when a full build commits
 building -> failed when no previous ready index can be served
-ready    -> stale when last_incremental_at is older than 2 * refresh_interval
+ready    -> stale when last_incremental_at is at least 2 * refresh_interval old
 stale    -> ready when refresh or rebuild catches up
 ready    -> failed only for unrecoverable source/schema errors
 ```
@@ -1034,7 +1034,7 @@ Normal refresh:
 1. find users with active tokens
 2. refresh each active user every index.refresh_interval_seconds
 3. if the refresh gap exceeds incremental_lookback_max_seconds, schedule a full rebuild
-4. process changed Joplin items since last_seen_joplin_updated_time
+4. process changed Joplin items at or after last_seen_joplin_updated_time
 5. upsert derived rows
 6. purge or tombstone hard-deleted rows when index.hard_delete_reconcile_interval_hours is due
 7. update index_state
@@ -1067,6 +1067,8 @@ Concurrency rules:
 7. cap rebuild work by row count, max_parallel_users, and indexer DB capacity
 8. never borrow runtime pool connections for full rebuild work
 9. update last_seen_joplin_updated_time only after all changed rows commit
+10. treat last_seen_joplin_updated_time as an inclusive timestamp boundary on
+    the next refresh, because multiple Joplin items can share one millisecond
 ```
 
 Deleted items:
@@ -1245,11 +1247,16 @@ Stable sort keys:
 list_notes:        updated_time DESC, joplin_id DESC
 get_recent_notes:  updated_time DESC, joplin_id DESC
 get_changes_since: updated_time ASC, joplin_id ASC
-search_notes:      rank DESC, updated_time DESC, joplin_id DESC
+search_notes:      rank_key DESC, updated_time DESC, joplin_id DESC
 get_notes_by_tag:  updated_time DESC, joplin_id DESC
 list_notebooks:    title ASC, joplin_id ASC if pagination is added
 list_tags:         title ASC, joplin_id ASC if pagination is added
 ```
+
+`search_notes` cursors must include a search mode (`fts` or `ilike`) and an
+integer `rank_key` derived from the database rank. Do not resume an `ilike`
+fallback page from an `fts` cursor. Legacy search cursors that only contain a
+floating-point `rank` must be rejected as stale.
 
 `body_cursor` for `get_note` is separate from list pagination. It must encode the
 note ID, the indexed note version, and the next body offset so a cursor from an
@@ -1319,19 +1326,33 @@ Input:
 Use Postgres full-text search:
 
 ```sql
-SELECT joplin_id, title, ts_rank(search_vector, plainto_tsquery('simple', $2)) AS rank
-FROM joplin_mcp.notes_index
-WHERE user_id = $1
-  AND search_vector @@ plainto_tsquery('simple', $2)
-ORDER BY rank DESC, updated_time DESC, joplin_id DESC
+WITH ranked AS (
+  SELECT
+    joplin_id,
+    title,
+    updated_time,
+    ts_rank(search_vector, plainto_tsquery('simple', $2)) AS rank
+  FROM joplin_mcp.notes_index
+  WHERE user_id = $1
+    AND search_vector @@ plainto_tsquery('simple', $2)
+),
+candidates AS (
+  SELECT *, round((rank::double precision * 1000000000.0))::bigint AS rank_key
+  FROM ranked
+)
+SELECT joplin_id, title, rank
+FROM candidates
+ORDER BY rank_key DESC, updated_time DESC, joplin_id DESC
 LIMIT $3;
 ```
 
 When a search cursor is supplied, the query builder must add the matching keyset
-predicate for `rank`, `updated_time`, and `joplin_id`.
+predicate for `rank_key`, `updated_time`, and `joplin_id`.
 
 Fallback to `ILIKE` only if full-text search gives no results and the query is
-short enough.
+short enough. Fallback may start on the first page or continue from a cursor that
+was created in `ilike` mode. It must not start from an `fts` cursor after a
+full-text page is exhausted.
 
 The SQL above shows the default `simple` text search config. If
 `index.text_search_config` is changed, migrations and query builders must use
@@ -1449,6 +1470,27 @@ Input:
 
 Returns notes changed since the supplied timestamp. This is the primary tool for
 LLM sessions that need to resume work without rescanning all notes.
+
+The `notes` array is a change feed. Active note changes include `deleted: false`
+and note metadata. Deletion tombstones are read from
+`joplin_mcp.deleted_items_index` and include `deleted: true`, `item_type`,
+`source`, and `deleted_time` when Joplin supplied one. For hard-delete
+reconciliation tombstones where `deleted_time` is absent, `updated_time` is the
+millisecond timestamp derived from `tombstoned_at`.
+
+Example tombstone:
+
+```json
+{
+  "id": "32-char Joplin ID",
+  "title": null,
+  "notebook_id": null,
+  "updated_time": 1777917600000,
+  "deleted": true,
+  "item_type": 1,
+  "source": "reconciliation"
+}
+```
 
 ### `get_note_resources`
 
@@ -1720,6 +1762,7 @@ deleted_time items are excluded from normal reads
 deleted_items_index records tombstones
 hard-deleted item IDs purge derived index rows
 stale index status transitions back to ready after refresh
+same-millisecond incremental refresh boundary does not skip later items
 runtime DB pool still serves status while indexer pool is saturated
 keyset cursors preserve stable order across pages
 schema validation fails on wrong column type

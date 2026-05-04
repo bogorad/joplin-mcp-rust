@@ -62,8 +62,9 @@ impl McpAuth {
     }
 }
 
-const JSONRPC_INVALID_PARAMS: i64 = -32602;
+const JSONRPC_INVALID_REQUEST: i64 = -32600;
 const JSONRPC_METHOD_NOT_FOUND: i64 = -32601;
+const JSONRPC_INVALID_PARAMS: i64 = -32602;
 const JSONRPC_TOOL_ERROR: i64 = -32000;
 
 pub async fn mcp_get() -> StatusCode {
@@ -102,6 +103,10 @@ pub async fn mcp_post(
         }
     };
 
+    if let Some(error) = null_request_id_error(&body) {
+        return json_rpc_response(error).into_response();
+    }
+
     if is_json_rpc_notification_or_response(&body) {
         return StatusCode::ACCEPTED.into_response();
     }
@@ -115,7 +120,10 @@ async fn dispatch_json_rpc_request(
     token: Option<&TokenRecord>,
     body: &Value,
 ) -> Value {
-    let id = body.get("id").cloned().unwrap_or(Value::Null);
+    let id = body
+        .get("id")
+        .cloned()
+        .expect("dispatched JSON-RPC requests include an id");
     let Some(method) = body.get("method").and_then(Value::as_str) else {
         return json_rpc_error(id, JSONRPC_INVALID_PARAMS, "missing JSON-RPC method", None);
     };
@@ -250,7 +258,7 @@ async fn call_tool(
 }
 
 fn tool_call_result(result: Value) -> Value {
-    let text = serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_string());
+    let text = result.to_string();
     json!({
         "content": [
             {
@@ -320,6 +328,19 @@ fn is_json_rpc_notification_or_response(body: &Value) -> bool {
     body.get("id").is_none() || body.get("method").is_none()
 }
 
+fn null_request_id_error(body: &Value) -> Option<Value> {
+    if body.get("method").is_some() && body.get("id").is_some_and(Value::is_null) {
+        return Some(json_rpc_error(
+            Value::Null,
+            JSONRPC_INVALID_REQUEST,
+            "request id must not be null",
+            None,
+        ));
+    }
+
+    None
+}
+
 fn accepts_json(headers: &HeaderMap) -> bool {
     headers
         .get(header::ACCEPT)
@@ -383,15 +404,46 @@ mod tests {
 
     #[test]
     fn notifications_and_responses_do_not_return_json_body() {
-        assert!(is_json_rpc_notification_or_response(
-            &json!({"jsonrpc":"2.0","method":"notifications/initialized"})
-        ));
-        assert!(is_json_rpc_notification_or_response(
-            &json!({"jsonrpc":"2.0","id":1,"result":{}})
-        ));
+        let notification = json!({"jsonrpc":"2.0","method":"notifications/initialized"});
+        assert_eq!(null_request_id_error(&notification), None);
+        assert!(is_json_rpc_notification_or_response(&notification));
+
+        let response = json!({"jsonrpc":"2.0","id":1,"result":{}});
+        assert_eq!(null_request_id_error(&response), None);
+        assert!(is_json_rpc_notification_or_response(&response));
+
         assert!(!is_json_rpc_notification_or_response(
             &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})
         ));
+    }
+
+    #[test]
+    fn null_request_id_returns_invalid_request_error() {
+        let request = json!({"jsonrpc":"2.0","id":null,"method":"tools/list"});
+
+        assert_eq!(
+            null_request_id_error(&request),
+            Some(json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": {
+                    "code": JSONRPC_INVALID_REQUEST,
+                    "message": "request id must not be null",
+                    "data": null
+                }
+            }))
+        );
+    }
+
+    #[test]
+    fn tool_call_result_text_matches_structured_content() {
+        let structured_content = json!({"note":"hello","count":2});
+        let text = structured_content.to_string();
+        let result = tool_call_result(structured_content.clone());
+
+        assert_eq!(&result["structuredContent"], &structured_content);
+        assert_eq!(result["content"][0]["text"].as_str(), Some(text.as_str()));
+        assert_eq!(result["isError"].as_bool(), Some(false));
     }
 
     #[test]

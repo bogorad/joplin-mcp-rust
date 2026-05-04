@@ -5,7 +5,7 @@ use chrono::{DateTime, Duration, Utc};
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use sha2::Sha256;
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgPool, Postgres, QueryBuilder};
 use std::fs;
 use uuid::Uuid;
 
@@ -165,10 +165,44 @@ impl TokenRepository {
     }
 
     pub async fn find_by_hash(&self, hash: &TokenHash) -> anyhow::Result<Option<TokenRecord>> {
+        self.find_by_hashes(std::slice::from_ref(hash)).await
+    }
+
+    pub async fn find_by_hashes(
+        &self,
+        hashes: &[TokenHash],
+    ) -> anyhow::Result<Option<TokenRecord>> {
+        if hashes.is_empty() {
+            return Ok(None);
+        }
+
         let mut conn = db_pool::acquire_runtime(&self.pool).await?;
 
-        let token = sqlx::query_as::<_, TokenRecord>(
+        let mut builder = QueryBuilder::<Postgres>::new(
             r#"
+            WITH candidate_hashes(token_hash, hmac_key_id, candidate_order) AS (
+                VALUES
+            "#,
+        );
+
+        for (candidate_order, hash) in hashes.iter().enumerate() {
+            if candidate_order > 0 {
+                builder.push(", ");
+            }
+            builder
+                .push("(")
+                .push_bind(hash.bytes.as_slice())
+                .push("::bytea, ")
+                .push_bind(hash.hmac_key_id.as_str())
+                .push("::text, ")
+                .push_bind(candidate_order as i32)
+                .push("::int4")
+                .push(")");
+        }
+
+        builder.push(
+            r#"
+            )
             SELECT
                 token.id,
                 token.user_id,
@@ -181,15 +215,20 @@ impl TokenRepository {
                 token.revoked_at,
                 token.expires_at,
                 users.disabled_at AS user_disabled_at
-            FROM joplin_mcp.mcp_tokens token
+            FROM candidate_hashes candidate
+            JOIN joplin_mcp.mcp_tokens token
+              ON token.token_hash = candidate.token_hash
+             AND token.hmac_key_id = candidate.hmac_key_id
             JOIN joplin_mcp.mcp_users users ON users.id = token.user_id
-            WHERE token.token_hash = $1 AND token.hmac_key_id = $2
+            ORDER BY candidate.candidate_order
+            LIMIT 1
             "#,
-        )
-        .bind(hash.bytes.as_slice())
-        .bind(&hash.hmac_key_id)
-        .fetch_optional(&mut *conn)
-        .await?;
+        );
+
+        let token = builder
+            .build_query_as::<TokenRecord>()
+            .fetch_optional(&mut *conn)
+            .await?;
 
         Ok(token)
     }
@@ -201,20 +240,14 @@ impl TokenRepository {
         now: DateTime<Utc>,
     ) -> Result<TokenRecord, TokenAuthError> {
         let raw_token = parse_bearer_token(authorization)?;
+        let hashes =
+            token_hashes_for_keys(keys, raw_token).map_err(|_| TokenAuthError::Malformed)?;
+        let token = self
+            .find_by_hashes(&hashes)
+            .await
+            .map_err(|_| TokenAuthError::Unknown)?;
 
-        for key in keys {
-            let hash = token_hash(&key.id, &key.bytes, raw_token)
-                .map_err(|_| TokenAuthError::Malformed)?;
-            let token = self
-                .find_by_hash(&hash)
-                .await
-                .map_err(|_| TokenAuthError::Unknown)?;
-            if let Some(token) = token {
-                return classify_token_record(Some(token), now);
-            }
-        }
-
-        Err(TokenAuthError::Unknown)
+        classify_token_record(token, now)
     }
 
     pub async fn revoke_token(
@@ -326,6 +359,12 @@ pub fn token_hash(
     })
 }
 
+fn token_hashes_for_keys(keys: &[HmacKey], raw_token: &str) -> anyhow::Result<Vec<TokenHash>> {
+    keys.iter()
+        .map(|key| token_hash(&key.id, &key.bytes, raw_token))
+        .collect()
+}
+
 pub fn generate_token_for_insert(
     user_id: Uuid,
     key: &HmacKey,
@@ -375,6 +414,11 @@ pub fn classify_token_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::migrations;
+    use sqlx::{
+        PgPool,
+        postgres::{PgConnectOptions, PgPoolOptions},
+    };
 
     fn key() -> HmacKey {
         HmacKey::new("2026-05", &[7_u8; 32]).expect("valid key")
@@ -401,6 +445,77 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct AuthTestDatabase {
+        database: String,
+    }
+
+    impl AuthTestDatabase {
+        async fn create(name: &str) -> anyhow::Result<(Self, PgPool)> {
+            let database = format!("joplin_mcpd_token_auth_{name}_{}", Uuid::new_v4().simple());
+            let admin = connect_auth_test_pool(auth_test_postgres_options("postgres")).await?;
+            sqlx::query(&format!(r#"CREATE DATABASE "{database}""#))
+                .execute(&admin)
+                .await
+                .with_context(|| format!("create disposable database {database}"))?;
+            admin.close().await;
+
+            let pool = connect_auth_test_pool(auth_test_postgres_options(&database)).await?;
+            migrations::run(&pool)
+                .await
+                .context("run MCP migrations for token auth test")?;
+            Ok((Self { database }, pool))
+        }
+
+        async fn drop(self) -> anyhow::Result<()> {
+            let database = self.database;
+            let admin = connect_auth_test_pool(auth_test_postgres_options("postgres")).await?;
+            sqlx::query(&format!(
+                r#"DROP DATABASE IF EXISTS "{database}" WITH (FORCE)"#
+            ))
+            .execute(&admin)
+            .await
+            .with_context(|| format!("drop disposable database {database}"))?;
+            admin.close().await;
+            Ok(())
+        }
+    }
+
+    fn auth_test_postgres_options(database: &str) -> PgConnectOptions {
+        PgConnectOptions::new()
+            .host("127.0.0.1")
+            .port(55432)
+            .username("postgres")
+            .password("local-postgres")
+            .database(database)
+    }
+
+    async fn connect_auth_test_pool(options: PgConnectOptions) -> anyhow::Result<PgPool> {
+        PgPoolOptions::new()
+            .max_connections(4)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect_with(options)
+            .await
+            .context("connect to disposable local Postgres")
+    }
+
+    async fn insert_auth_test_user(pool: &PgPool, joplin_user_id: &str) -> anyhow::Result<Uuid> {
+        let user_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO joplin_mcp.mcp_users (id, joplin_user_id, joplin_email, last_login_at)
+            VALUES ($1, $2, $3, now())
+            "#,
+        )
+        .bind(user_id)
+        .bind(joplin_user_id)
+        .bind(format!("{joplin_user_id}@example.test"))
+        .execute(pool)
+        .await
+        .context("insert disposable MCP user")?;
+        Ok(user_id)
+    }
+
     #[test]
     fn generated_token_has_mcp_prefix_and_random_body() {
         let token = generate_raw_token();
@@ -416,6 +531,18 @@ mod tests {
         assert_eq!(hash.hmac_key_id, "2026-05");
         assert_ne!(hash.bytes.as_slice(), token.as_bytes());
         assert_eq!(hash.bytes.len(), 32);
+    }
+
+    #[test]
+    fn token_hashes_for_keys_preserve_key_order() {
+        let raw = generate_raw_token();
+        let first = HmacKey::new("first", &[1_u8; 32]).expect("valid first key");
+        let second = HmacKey::new("second", &[2_u8; 32]).expect("valid second key");
+        let hashes = token_hashes_for_keys(&[first, second], &raw).expect("hash all keys");
+
+        assert_eq!(hashes.len(), 2);
+        assert_eq!(hashes[0], token_hash("first", &[1_u8; 32], &raw).unwrap());
+        assert_eq!(hashes[1], token_hash("second", &[2_u8; 32], &raw).unwrap());
     }
 
     #[test]
@@ -512,5 +639,74 @@ mod tests {
             generated.raw_token.as_bytes()
         );
         assert_eq!(generated.insert.label, "workstation");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable local Postgres from tests/compose.local.yaml"]
+    async fn authenticate_bearer_batches_multi_key_lookup_and_preserves_token_states()
+    -> anyhow::Result<()> {
+        let (database, pool) = AuthTestDatabase::create("batch").await?;
+        let result = async {
+            let repository = TokenRepository::new(pool.clone());
+            let first_key = HmacKey::new("first", &[1_u8; 32]).expect("valid first key");
+            let second_key = HmacKey::new("second", &[2_u8; 32]).expect("valid second key");
+            let keys = vec![first_key.clone(), second_key.clone()];
+            let user_id = insert_auth_test_user(&pool, "token-user").await?;
+            let now = Utc::now();
+
+            let first = repository
+                .create_token(user_id, &first_key, "first-key", "read", None, None)
+                .await?;
+            let first_header = format!("Bearer {}", first.raw_token);
+            let first_record = repository
+                .authenticate_bearer(Some(&first_header), &keys, now)
+                .await
+                .expect("first-key token authenticates");
+            assert_eq!(first_record.id, first.insert.id);
+
+            let later = repository
+                .create_token(user_id, &second_key, "later-key", "read", None, None)
+                .await?;
+            let later_header = format!("Bearer {}", later.raw_token);
+            let later_record = repository
+                .authenticate_bearer(Some(&later_header), &keys, now)
+                .await
+                .expect("later-key token authenticates");
+            assert_eq!(later_record.id, later.insert.id);
+
+            let revoked = repository
+                .create_token(user_id, &second_key, "revoked", "read", None, None)
+                .await?;
+            let revoked_header = format!("Bearer {}", revoked.raw_token);
+            assert!(
+                repository
+                    .revoke_token(revoked.insert.id, None, Some("test"), None)
+                    .await?
+            );
+            assert_eq!(
+                repository
+                    .authenticate_bearer(Some(&revoked_header), &keys, now)
+                    .await
+                    .expect_err("revoked token rejected"),
+                TokenAuthError::Revoked
+            );
+
+            let unknown_header = format!("Bearer {}", generate_raw_token());
+            assert_eq!(
+                repository
+                    .authenticate_bearer(Some(&unknown_header), &keys, now)
+                    .await
+                    .expect_err("unknown token rejected"),
+                TokenAuthError::Unknown
+            );
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        pool.close().await;
+        let drop_result = database.drop().await;
+        result?;
+        drop_result
     }
 }
