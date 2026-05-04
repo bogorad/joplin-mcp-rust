@@ -1,3 +1,4 @@
+dolt.host: "localhost"
 dolt.database: "joplin_mcp_rust"
 issue_prefix: "jmr-"
 
@@ -6,3 +7,5 @@ ai.model: "gpt-5"
 export.path: "../docs/beads-issues.jsonl"
 
 export.git-add: false
+
+dolt.port: 3307
