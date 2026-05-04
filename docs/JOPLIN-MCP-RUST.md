@@ -516,6 +516,7 @@ full_rebuild_interval_hours = 24
 max_parallel_users = 4
 text_search_config = "simple"
 incremental_lookback_max_seconds = 86400
+hard_delete_reconcile_interval_hours = 24
 
 [logging]
 service_name = "joplin-mcpd"
@@ -773,6 +774,8 @@ CREATE TABLE joplin_mcp.index_state (
   status text NOT NULL,
   last_full_rebuild_at timestamptz,
   last_incremental_at timestamptz,
+  last_checked_at timestamptz,
+  last_reconciled_at timestamptz,
   last_seen_joplin_updated_time bigint,
   last_error text,
   updated_at timestamptz NOT NULL DEFAULT now()
@@ -1033,7 +1036,7 @@ Normal refresh:
 3. if the refresh gap exceeds incremental_lookback_max_seconds, schedule a full rebuild
 4. process changed Joplin items since last_seen_joplin_updated_time
 5. upsert derived rows
-6. purge or tombstone deleted rows
+6. purge or tombstone hard-deleted rows when index.hard_delete_reconcile_interval_hours is due
 7. update index_state
 ```
 

@@ -1,4 +1,4 @@
-use crate::contracts::is_joplin_user_id;
+use crate::{contracts::is_joplin_user_id, db::pool as db_pool};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
@@ -208,9 +208,13 @@ pub async fn resolve_joplin_user_by_id(
         ));
     }
 
+    let mut conn = db_pool::acquire_indexer(pool)
+        .await
+        .map_err(|_| BootstrapAuthError::new(BootstrapAuthFailure::JoplinUnavailable))?;
+
     sqlx::query_as::<_, JoplinUser>(JOPLIN_USER_BY_ID_QUERY)
         .bind(joplin_user_id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(|_| BootstrapAuthError::new(BootstrapAuthFailure::JoplinUnavailable))?
         .ok_or_else(|| BootstrapAuthError::new(BootstrapAuthFailure::JoplinUserNotFound))
@@ -226,11 +230,15 @@ pub async fn upsert_mcp_user_by_joplin_user(
         ));
     }
 
+    let mut conn = db_pool::acquire_runtime(pool)
+        .await
+        .map_err(|_| BootstrapAuthError::new(BootstrapAuthFailure::McpUserUpsertFailed))?;
+
     sqlx::query_as::<_, McpUser>(MCP_USER_UPSERT_QUERY)
         .bind(Uuid::new_v4())
         .bind(&joplin_user.id)
         .bind(&joplin_user.email)
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await
         .map_err(|_| BootstrapAuthError::new(BootstrapAuthFailure::McpUserUpsertFailed))
 }

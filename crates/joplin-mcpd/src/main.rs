@@ -9,7 +9,6 @@ use joplin_mcpd::{
     lifecycle::{Readiness, ReadinessStatus},
     logging::init_logging,
     mcp::transport::McpAuth,
-    observability::metrics,
 };
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use std::{fs, path::PathBuf, sync::Arc, time::Duration};
@@ -99,7 +98,6 @@ async fn connect_mcp_pool(config: &Config) -> anyhow::Result<sqlx::PgPool> {
         .as_deref()
         .context("postgres.mcp_dsn_file is required")?;
     let dsn = fs::read_to_string(dsn_file).context("read postgres.mcp_dsn_file credential")?;
-    let started = std::time::Instant::now();
     let pool = PgPoolOptions::new()
         .max_connections(config.postgres.runtime_max_connections)
         .acquire_timeout(Duration::from_secs(config.postgres.acquire_timeout_seconds))
@@ -109,7 +107,6 @@ async fn connect_mcp_pool(config: &Config) -> anyhow::Result<sqlx::PgPool> {
         )?)
         .await
         .context("connect to MCP database")?;
-    metrics::record_postgres_pool_wait("runtime", started.elapsed());
     Ok(pool)
 }
 
@@ -120,7 +117,6 @@ async fn connect_joplin_pool(config: &Config) -> anyhow::Result<sqlx::PgPool> {
         .as_deref()
         .context("postgres.joplin_dsn_file is required")?;
     let dsn = fs::read_to_string(dsn_file).context("read postgres.joplin_dsn_file credential")?;
-    let started = std::time::Instant::now();
     let pool = PgPoolOptions::new()
         .max_connections(config.postgres.indexer_max_connections)
         .acquire_timeout(Duration::from_secs(config.postgres.acquire_timeout_seconds))
@@ -130,7 +126,6 @@ async fn connect_joplin_pool(config: &Config) -> anyhow::Result<sqlx::PgPool> {
         )?)
         .await
         .context("connect to Joplin source database")?;
-    metrics::record_postgres_pool_wait("indexer", started.elapsed());
     Ok(pool)
 }
 

@@ -1,3 +1,4 @@
+use crate::db::pool as db_pool;
 use anyhow::{Context, bail};
 use sqlx::{PgPool, Row};
 use std::collections::BTreeMap;
@@ -89,6 +90,10 @@ pub async fn validate_joplin_source_schema(pool: &PgPool) -> anyhow::Result<()> 
 pub async fn fetch_actual_columns(
     pool: &PgPool,
 ) -> anyhow::Result<BTreeMap<(String, String), String>> {
+    let mut conn = db_pool::acquire_indexer(pool)
+        .await
+        .context("acquire indexer database connection")?;
+
     let rows = sqlx::query(
         r#"
         SELECT table_name, column_name, data_type
@@ -98,7 +103,7 @@ pub async fn fetch_actual_columns(
         ORDER BY table_name, column_name
         "#,
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await
     .context("read Joplin source information_schema columns")?;
 
@@ -140,6 +145,10 @@ pub fn validate_columns(actual: &BTreeMap<(String, String), String>) -> anyhow::
 }
 
 pub async fn validate_external_storage(pool: &PgPool) -> anyhow::Result<()> {
+    let mut conn = db_pool::acquire_indexer(pool)
+        .await
+        .context("acquire indexer database connection")?;
+
     let rows = sqlx::query(
         r#"
         SELECT content
@@ -150,7 +159,7 @@ pub async fn validate_external_storage(pool: &PgPool) -> anyhow::Result<()> {
         LIMIT 100
         "#,
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await
     .context("sample Joplin item content")?;
 

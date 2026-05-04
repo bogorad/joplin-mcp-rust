@@ -206,9 +206,9 @@ async fn call_tool(
     let max_response_bytes = state.config.mcp.max_response_bytes;
 
     match name {
-        "status" => status_tool(mcp_pool, &scope).await,
-        "list_notebooks" => list_notebooks_tool(mcp_pool, &scope).await,
-        "list_tags" => list_tags_tool(mcp_pool, &scope).await,
+        "status" => status_tool(mcp_pool, &scope, max_response_bytes).await,
+        "list_notebooks" => list_notebooks_tool(mcp_pool, &scope, max_response_bytes).await,
+        "list_tags" => list_tags_tool(mcp_pool, &scope, max_response_bytes).await,
         "list_notes" => {
             list_notes_tool(mcp_pool, &scope, &arguments, cursor_key, max_response_bytes).await
         }
@@ -233,8 +233,11 @@ async fn call_tool(
             get_recent_notes_tool(mcp_pool, &scope, &arguments, cursor_key, max_response_bytes)
                 .await
         }
-        "get_notes_by_tag" => get_notes_by_tag_tool(mcp_pool, &scope, &arguments, cursor_key).await,
-        "get_notebook_tree" => get_notebook_tree_tool(mcp_pool, &scope).await,
+        "get_notes_by_tag" => {
+            get_notes_by_tag_tool(mcp_pool, &scope, &arguments, cursor_key, max_response_bytes)
+                .await
+        }
+        "get_notebook_tree" => get_notebook_tree_tool(mcp_pool, &scope, max_response_bytes).await,
         "get_changes_since" => {
             get_changes_since_tool(mcp_pool, &scope, &arguments, cursor_key, max_response_bytes)
                 .await

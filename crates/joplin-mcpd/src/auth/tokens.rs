@@ -1,4 +1,4 @@
-use crate::config::HmacKeyConfig;
+use crate::{config::HmacKeyConfig, db::pool as db_pool};
 use anyhow::Context;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Duration, Utc};
@@ -118,6 +118,8 @@ impl TokenRepository {
     }
 
     pub async fn insert_generated_token(&self, token: &TokenInsert) -> anyhow::Result<()> {
+        let mut conn = db_pool::acquire_runtime(&self.pool).await?;
+
         sqlx::query(
             r#"
             INSERT INTO joplin_mcp.mcp_tokens (
@@ -141,7 +143,7 @@ impl TokenRepository {
         .bind(&token.scope)
         .bind(token.created_from_ip.as_deref())
         .bind(token.expires_at)
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await?;
 
         Ok(())
@@ -163,6 +165,8 @@ impl TokenRepository {
     }
 
     pub async fn find_by_hash(&self, hash: &TokenHash) -> anyhow::Result<Option<TokenRecord>> {
+        let mut conn = db_pool::acquire_runtime(&self.pool).await?;
+
         let token = sqlx::query_as::<_, TokenRecord>(
             r#"
             SELECT
@@ -184,7 +188,7 @@ impl TokenRepository {
         )
         .bind(hash.bytes.as_slice())
         .bind(&hash.hmac_key_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *conn)
         .await?;
 
         Ok(token)
@@ -220,6 +224,8 @@ impl TokenRepository {
         reason: Option<&str>,
         revoked_from_ip: Option<&str>,
     ) -> anyhow::Result<bool> {
+        let mut conn = db_pool::acquire_runtime(&self.pool).await?;
+
         let result = sqlx::query(
             r#"
             UPDATE joplin_mcp.mcp_tokens
@@ -235,7 +241,7 @@ impl TokenRepository {
         .bind(revoked_by)
         .bind(reason)
         .bind(revoked_from_ip)
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await?;
 
         Ok(result.rows_affected() == 1)
@@ -248,6 +254,8 @@ impl TokenRepository {
         min_interval: Duration,
     ) -> anyhow::Result<bool> {
         let stale_before = now - min_interval;
+        let mut conn = db_pool::acquire_runtime(&self.pool).await?;
+
         let result = sqlx::query(
             r#"
             UPDATE joplin_mcp.mcp_tokens
@@ -260,7 +268,7 @@ impl TokenRepository {
         .bind(token_id)
         .bind(now)
         .bind(stale_before)
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await?;
 
         Ok(result.rows_affected() == 1)

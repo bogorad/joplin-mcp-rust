@@ -1,3 +1,4 @@
+use crate::db::pool as db_pool;
 use serde_json::{Map, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -84,6 +85,8 @@ impl AuditRecord {
 }
 
 pub async fn write_audit_log(pool: &PgPool, record: AuditRecord) -> anyhow::Result<()> {
+    let mut conn = db_pool::acquire_runtime(pool).await?;
+
     sqlx::query(
         r#"
         INSERT INTO joplin_mcp.audit_log (
@@ -105,7 +108,7 @@ pub async fn write_audit_log(pool: &PgPool, record: AuditRecord) -> anyhow::Resu
     .bind(record.client_label.as_deref())
     .bind(record.remote_ip.as_deref())
     .bind(record.metadata)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
 
     Ok(())

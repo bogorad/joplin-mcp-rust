@@ -81,6 +81,7 @@ impl Config {
             || self.index.full_rebuild_interval_hours == 0
             || self.index.max_parallel_users == 0
             || self.index.incremental_lookback_max_seconds == 0
+            || self.index.hard_delete_reconcile_interval_hours == 0
         {
             bail!("index timing and concurrency values must be greater than zero");
         }
@@ -294,6 +295,7 @@ pub struct IndexConfig {
     pub max_parallel_users: u32,
     pub text_search_config: String,
     pub incremental_lookback_max_seconds: u64,
+    pub hard_delete_reconcile_interval_hours: u64,
 }
 
 impl Default for IndexConfig {
@@ -304,6 +306,7 @@ impl Default for IndexConfig {
             max_parallel_users: 4,
             text_search_config: "simple".to_string(),
             incremental_lookback_max_seconds: 86_400,
+            hard_delete_reconcile_interval_hours: 24,
         }
     }
 }

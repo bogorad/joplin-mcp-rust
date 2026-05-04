@@ -123,7 +123,7 @@ async fn repeated_worker_refresh_updates_changed_rows_without_dangling_tag_edges
     let initial_state = index_state(&mcp_pool, user_id).await?;
     ensure_eq(
         initial_state.last_seen_joplin_updated_time,
-        Some(12),
+        Some(13),
         "initial watermark",
     )?;
     assert_note_body(&mcp_pool, user_id, "note-a", "Initial body").await?;

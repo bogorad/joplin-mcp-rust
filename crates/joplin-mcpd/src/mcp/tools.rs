@@ -1,5 +1,6 @@
 use crate::{
     contracts::{ErrorCode, READ_ONLY_MODE, UNSUPPORTED_SHARED_NOTEBOOKS},
+    db::pool as db_pool,
     indexer::refresh::request_index_refresh_now,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -19,6 +20,7 @@ const CURSOR_VERSION: u8 = 1;
 const DEFAULT_RETRY_AFTER_SECONDS: u64 = 5;
 const NOTE_PREVIEW_CHARS: usize = 200;
 const ILIKE_FALLBACK_MAX_QUERY_CHARS: usize = 128;
+const ILIKE_ESCAPE_CHAR: char = '!';
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolDefinition {
@@ -95,10 +97,18 @@ impl ToolError {
     }
 
     pub(crate) fn internal(message: impl Into<String>, error: impl std::fmt::Display) -> Self {
+        let message = message.into();
+        let error = crate::logging::sanitize_error_text(&error.to_string());
+        tracing::warn!(
+            operation = "mcp_tool_internal_error",
+            %message,
+            %error,
+            "MCP internal tool error"
+        );
         Self {
             code: ErrorCode::Internal,
-            message: message.into(),
-            data: Some(json!({ "error": error.to_string() })),
+            message,
+            data: Some(json!({ "error": "internal_error" })),
         }
     }
 
@@ -109,6 +119,14 @@ impl ToolError {
             "data": self.data
         })
     }
+}
+
+async fn acquire_runtime_connection(
+    pool: &PgPool,
+) -> Result<sqlx::pool::PoolConnection<sqlx::Postgres>, ToolError> {
+    db_pool::acquire_runtime(pool)
+        .await
+        .map_err(|error| ToolError::internal("failed to acquire database connection", error))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,11 +247,8 @@ pub fn enforce_response_budget(
     value: Value,
     max_response_bytes: usize,
 ) -> Result<Value, ToolError> {
-    let bytes = serde_json::to_vec(&value).map_err(|error| ToolError {
-        code: ErrorCode::Internal,
-        message: "failed to serialize MCP response".to_string(),
-        data: Some(json!({ "error": error.to_string() })),
-    })?;
+    let bytes = serde_json::to_vec(&value)
+        .map_err(|error| ToolError::internal("failed to serialize MCP response", error))?;
 
     if bytes.len() > max_response_bytes {
         Err(ToolError::response_too_large(
@@ -273,11 +288,8 @@ pub fn encode_cursor(payload: &CursorPayload, signing_key: &[u8]) -> Result<Stri
     if payload.version != CURSOR_VERSION {
         return Err(ToolError::validation("unsupported cursor version"));
     }
-    let body = serde_json::to_vec(payload).map_err(|error| ToolError {
-        code: ErrorCode::Internal,
-        message: "failed to encode cursor".to_string(),
-        data: Some(json!({ "error": error.to_string() })),
-    })?;
+    let body = serde_json::to_vec(payload)
+        .map_err(|error| ToolError::internal("failed to encode cursor", error))?;
     let body = URL_SAFE_NO_PAD.encode(body);
     let signature = sign_cursor_body(&body, signing_key)?;
     Ok(format!("{CURSOR_PREFIX}.{body}.{signature}"))
@@ -331,6 +343,17 @@ fn sign_cursor_body(body: &str, signing_key: &[u8]) -> Result<String, ToolError>
         .map_err(|_| ToolError::validation("cursor signing key must be valid for HMAC-SHA256"))?;
     mac.update(body.as_bytes());
     Ok(URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
+}
+
+fn escape_ilike_pattern(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, ILIKE_ESCAPE_CHAR | '%' | '_') {
+            escaped.push(ILIKE_ESCAPE_CHAR);
+        }
+        escaped.push(ch);
+    }
+    escaped
 }
 
 pub fn tools_list_response() -> Value {
@@ -674,7 +697,13 @@ pub fn status_response(user: &str, index: IndexMetadata) -> Value {
     })
 }
 
-pub async fn status_tool(pool: &PgPool, scope: &UserScope) -> Result<Value, ToolError> {
+pub async fn status_tool(
+    pool: &PgPool,
+    scope: &UserScope,
+    max_response_bytes: usize,
+) -> Result<Value, ToolError> {
+    let mut conn = acquire_runtime_connection(pool).await?;
+
     let row = sqlx::query_as::<_, StatusRow>(
         r#"
         SELECT
@@ -690,28 +719,41 @@ pub async fn status_tool(pool: &PgPool, scope: &UserScope) -> Result<Value, Tool
         "#,
     )
     .bind(scope.user_id())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await
     .map_err(|error| ToolError::internal("failed to read status", error))?
     .ok_or_else(|| ToolError::not_found("user not found"))?;
 
     let joplin_email = row.joplin_email.clone();
     let index = row.index_metadata()?;
-    Ok(status_response(&joplin_email, index))
+    enforce_response_budget(status_response(&joplin_email, index), max_response_bytes)
 }
 
-pub async fn list_notebooks_tool(pool: &PgPool, scope: &UserScope) -> Result<Value, ToolError> {
+pub async fn list_notebooks_tool(
+    pool: &PgPool,
+    scope: &UserScope,
+    max_response_bytes: usize,
+) -> Result<Value, ToolError> {
     let index = ready_index_metadata(pool, scope).await?;
     let notebooks = fetch_notebook_rows(pool, scope).await?;
-    Ok(json!({
-        "index_status": index.index_status,
-        "last_indexed_at": index.last_indexed_at,
-        "notebooks": notebook_items(&notebooks)
-    }))
+    enforce_response_budget(
+        json!({
+            "index_status": index.index_status,
+            "last_indexed_at": index.last_indexed_at,
+            "notebooks": notebook_items(&notebooks)
+        }),
+        max_response_bytes,
+    )
 }
 
-pub async fn list_tags_tool(pool: &PgPool, scope: &UserScope) -> Result<Value, ToolError> {
+pub async fn list_tags_tool(
+    pool: &PgPool,
+    scope: &UserScope,
+    max_response_bytes: usize,
+) -> Result<Value, ToolError> {
     let index = ready_index_metadata(pool, scope).await?;
+    let mut conn = acquire_runtime_connection(pool).await?;
+
     let tags = sqlx::query_as::<_, TagRow>(
         r#"
         SELECT
@@ -725,31 +767,42 @@ pub async fn list_tags_tool(pool: &PgPool, scope: &UserScope) -> Result<Value, T
         LEFT JOIN joplin_mcp.notes_index notes
             ON notes.user_id = tags.user_id
             AND notes.joplin_id = edges.note_joplin_id
+            AND notes.deleted_time IS NULL
         WHERE tags.user_id = $1
         GROUP BY tags.joplin_id, tags.title
         ORDER BY tags.title ASC, tags.joplin_id ASC
         "#,
     )
     .bind(scope.user_id())
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await
     .map_err(|error| ToolError::internal("failed to list tags", error))?;
 
-    Ok(json!({
-        "index_status": index.index_status,
-        "last_indexed_at": index.last_indexed_at,
-        "tags": tags
-    }))
+    enforce_response_budget(
+        json!({
+            "index_status": index.index_status,
+            "last_indexed_at": index.last_indexed_at,
+            "tags": tags
+        }),
+        max_response_bytes,
+    )
 }
 
-pub async fn get_notebook_tree_tool(pool: &PgPool, scope: &UserScope) -> Result<Value, ToolError> {
+pub async fn get_notebook_tree_tool(
+    pool: &PgPool,
+    scope: &UserScope,
+    max_response_bytes: usize,
+) -> Result<Value, ToolError> {
     let index = ready_index_metadata(pool, scope).await?;
     let notebooks = fetch_notebook_rows(pool, scope).await?;
-    Ok(json!({
-        "index_status": index.index_status,
-        "last_indexed_at": index.last_indexed_at,
-        "notebooks": notebook_tree(&notebooks)
-    }))
+    enforce_response_budget(
+        json!({
+            "index_status": index.index_status,
+            "last_indexed_at": index.last_indexed_at,
+            "notebooks": notebook_tree(&notebooks)
+        }),
+        max_response_bytes,
+    )
 }
 
 pub async fn get_notes_by_tag_tool(
@@ -757,6 +810,7 @@ pub async fn get_notes_by_tag_tool(
     scope: &UserScope,
     input: &Value,
     cursor_signing_key: &[u8],
+    max_response_bytes: usize,
 ) -> Result<Value, ToolError> {
     validate_tool_input("get_notes_by_tag", input)?;
     let index = ready_index_metadata(pool, scope).await?;
@@ -787,13 +841,16 @@ pub async fn get_notes_by_tag_tool(
         None
     };
 
-    Ok(json!({
-        "index_status": index.index_status,
-        "last_indexed_at": index.last_indexed_at,
-        "tag_id": tag_id,
-        "notes": notes,
-        "next_cursor": next_cursor
-    }))
+    enforce_response_budget(
+        json!({
+            "index_status": index.index_status,
+            "last_indexed_at": index.last_indexed_at,
+            "tag_id": tag_id,
+            "notes": notes,
+            "next_cursor": next_cursor
+        }),
+        max_response_bytes,
+    )
 }
 
 pub async fn list_notes_tool(
@@ -1155,6 +1212,8 @@ async fn ready_index_metadata(
     pool: &PgPool,
     scope: &UserScope,
 ) -> Result<IndexMetadata, ToolError> {
+    let mut conn = acquire_runtime_connection(pool).await?;
+
     let snapshot = sqlx::query_as::<_, IndexStateRow>(
         r#"
         SELECT status, last_full_rebuild_at, last_incremental_at, last_checked_at, updated_at
@@ -1163,7 +1222,7 @@ async fn ready_index_metadata(
         "#,
     )
     .bind(scope.user_id())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await
     .map_err(|error| ToolError::internal("failed to read index state", error))?
     .map(IndexStateRow::snapshot)
@@ -1182,6 +1241,8 @@ async fn fetch_notebook_rows(
     pool: &PgPool,
     scope: &UserScope,
 ) -> Result<Vec<NotebookRow>, ToolError> {
+    let mut conn = acquire_runtime_connection(pool).await?;
+
     sqlx::query_as::<_, NotebookRow>(
         r#"
         SELECT
@@ -1193,13 +1254,14 @@ async fn fetch_notebook_rows(
         LEFT JOIN joplin_mcp.notes_index notes
             ON notes.user_id = notebooks.user_id
             AND notes.parent_joplin_id = notebooks.joplin_id
+            AND notes.deleted_time IS NULL
         WHERE notebooks.user_id = $1
         GROUP BY notebooks.joplin_id, notebooks.parent_joplin_id, notebooks.title
         ORDER BY notebooks.title ASC, notebooks.joplin_id ASC
         "#,
     )
     .bind(scope.user_id())
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await
     .map_err(|error| ToolError::internal("failed to list notebooks", error))
 }
@@ -1209,6 +1271,8 @@ async fn ensure_tag_visible(
     scope: &UserScope,
     tag_id: &str,
 ) -> Result<(), ToolError> {
+    let mut conn = acquire_runtime_connection(pool).await?;
+
     let exists = sqlx::query_scalar::<_, bool>(
         r#"
         SELECT EXISTS (
@@ -1220,7 +1284,7 @@ async fn ensure_tag_visible(
     )
     .bind(scope.user_id())
     .bind(tag_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await
     .map_err(|error| ToolError::internal("failed to read tag", error))?;
 
@@ -1238,6 +1302,8 @@ async fn fetch_notes_by_tag_rows(
     limit: i64,
     after: Option<(i64, String)>,
 ) -> Result<Vec<NoteSummary>, ToolError> {
+    let mut conn = acquire_runtime_connection(pool).await?;
+
     let rows = sqlx::query_as::<_, NoteSummary>(
         r#"
         SELECT
@@ -1251,6 +1317,7 @@ async fn fetch_notes_by_tag_rows(
             AND notes.joplin_id = edges.note_joplin_id
         WHERE edges.user_id = $1
             AND edges.tag_joplin_id = $2
+            AND notes.deleted_time IS NULL
             AND (
                 $3::bigint IS NULL
                 OR COALESCE(notes.updated_time, 0) < $3
@@ -1265,7 +1332,7 @@ async fn fetch_notes_by_tag_rows(
     .bind(after.as_ref().map(|(updated_time, _)| *updated_time))
     .bind(after.as_ref().map(|(_, joplin_id)| joplin_id.as_str()))
     .bind(limit)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await
     .map_err(|error| ToolError::internal("failed to list notes by tag", error))?;
 
@@ -1279,6 +1346,8 @@ async fn fetch_note_list_rows(
     limit: i64,
     after: Option<(i64, String)>,
 ) -> Result<Vec<NoteListRow>, ToolError> {
+    let mut conn = acquire_runtime_connection(pool).await?;
+
     sqlx::query_as::<_, NoteListRow>(
         r#"
         SELECT
@@ -1326,7 +1395,7 @@ async fn fetch_note_list_rows(
     .bind(after.as_ref().map(|(updated_time, _)| *updated_time))
     .bind(after.as_ref().map(|(_, joplin_id)| joplin_id.as_str()))
     .bind(limit)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await
     .map_err(|error| ToolError::internal("failed to list notes", error))
 }
@@ -1340,6 +1409,10 @@ async fn fetch_search_note_rows(
     after: Option<(f32, i64, String)>,
     mode: SearchMode,
 ) -> Result<Vec<SearchNoteRow>, ToolError> {
+    let search_query = match mode {
+        SearchMode::FullText => request.query.clone(),
+        SearchMode::IlikeFallback => escape_ilike_pattern(&request.query),
+    };
     let query = match mode {
         SearchMode::FullText => {
             r#"
@@ -1401,7 +1474,10 @@ async fn fetch_search_note_rows(
             FROM joplin_mcp.notes_index notes
             WHERE notes.user_id = $1
                 AND notes.deleted_time IS NULL
-                AND (notes.title ILIKE '%' || $3 || '%' OR notes.body_text ILIKE '%' || $3 || '%')
+                AND (
+                    notes.title ILIKE '%' || $3 || '%' ESCAPE '!'
+                    OR notes.body_text ILIKE '%' || $3 || '%' ESCAPE '!'
+                )
                 AND ($4::text IS NULL OR notes.parent_joplin_id = $4)
                 AND ($5::bigint IS NULL OR notes.updated_time >= $5)
                 AND ($6::bigint IS NULL OR notes.updated_time <= $6)
@@ -1432,10 +1508,12 @@ async fn fetch_search_note_rows(
         }
     };
 
+    let mut conn = acquire_runtime_connection(pool).await?;
+
     sqlx::query_as::<_, SearchNoteRow>(query)
         .bind(scope.user_id())
         .bind(text_search_config)
-        .bind(&request.query)
+        .bind(&search_query)
         .bind(request.notebook_id.as_deref())
         .bind(request.updated_after)
         .bind(request.updated_before)
@@ -1445,7 +1523,7 @@ async fn fetch_search_note_rows(
         .bind(after.as_ref().map(|(_, updated_time, _)| *updated_time))
         .bind(after.as_ref().map(|(_, _, joplin_id)| joplin_id.as_str()))
         .bind(limit)
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await
         .map_err(|error| ToolError::internal("failed to search notes", error))
 }
@@ -1455,6 +1533,8 @@ async fn fetch_note_body_row(
     scope: &UserScope,
     note_id: &str,
 ) -> Result<NoteBodyRow, ToolError> {
+    let mut conn = acquire_runtime_connection(pool).await?;
+
     sqlx::query_as::<_, NoteBodyRow>(
         r#"
         SELECT
@@ -1472,7 +1552,7 @@ async fn fetch_note_body_row(
     )
     .bind(scope.user_id())
     .bind(note_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await
     .map_err(|error| ToolError::internal("failed to read note", error))?
     .ok_or_else(|| ToolError::not_found("note not found"))
@@ -1485,6 +1565,8 @@ async fn fetch_changes_since_rows(
     limit: i64,
     after: Option<(i64, String)>,
 ) -> Result<Vec<NoteChange>, ToolError> {
+    let mut conn = acquire_runtime_connection(pool).await?;
+
     sqlx::query_as::<_, NoteChange>(
         r#"
         SELECT
@@ -1510,7 +1592,7 @@ async fn fetch_changes_since_rows(
     .bind(after.as_ref().map(|(updated_time, _)| *updated_time))
     .bind(after.as_ref().map(|(_, joplin_id)| joplin_id.as_str()))
     .bind(limit)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await
     .map_err(|error| ToolError::internal("failed to get changes since timestamp", error))
 }
@@ -1520,6 +1602,8 @@ async fn fetch_note_resource_refs(
     scope: &UserScope,
     note_id: &str,
 ) -> Result<Vec<String>, ToolError> {
+    let mut conn = acquire_runtime_connection(pool).await?;
+
     sqlx::query_scalar::<_, Vec<String>>(
         r#"
         SELECT resource_refs
@@ -1531,7 +1615,7 @@ async fn fetch_note_resource_refs(
     )
     .bind(scope.user_id())
     .bind(note_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await
     .map_err(|error| ToolError::internal("failed to read note resources", error))?
     .ok_or_else(|| ToolError::not_found("note not found"))
@@ -1545,6 +1629,8 @@ async fn fetch_resource_rows(
     if resource_refs.is_empty() {
         return Ok(Vec::new());
     }
+
+    let mut conn = acquire_runtime_connection(pool).await?;
 
     sqlx::query_as::<_, ResourceRow>(
         r#"
@@ -1562,7 +1648,7 @@ async fn fetch_resource_rows(
     )
     .bind(scope.user_id())
     .bind(resource_refs)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await
     .map_err(|error| ToolError::internal("failed to read resource metadata", error))
 }
@@ -2253,6 +2339,74 @@ mod tests {
             .expect_err("large response rejected");
         assert_eq!(error.code, ErrorCode::Validation);
         assert!(error.data.expect("data")["actual_response_bytes"].as_u64() > Some(8));
+    }
+
+    #[test]
+    fn internal_errors_do_not_return_raw_error_text_to_clients() {
+        let error = ToolError::internal(
+            "failed to search notes",
+            "database error: SELECT * FROM secret_table password=secret",
+        );
+        let response = error.to_mcp_error();
+        let encoded = response.to_string();
+
+        assert_eq!(response["data"]["error"], "internal_error");
+        assert!(!encoded.contains("secret_table"));
+        assert!(!encoded.contains("password=secret"));
+    }
+
+    #[test]
+    fn ilike_fallback_escapes_user_wildcards_as_literals() {
+        assert_eq!(escape_ilike_pattern("plain text"), "plain text");
+        assert_eq!(escape_ilike_pattern("%"), "!%");
+        assert_eq!(escape_ilike_pattern("_"), "!_");
+        assert_eq!(escape_ilike_pattern("a!b"), "a!!b");
+        assert_eq!(escape_ilike_pattern("50%_done!"), "50!%!_done!!");
+    }
+
+    #[test]
+    fn search_fallback_sql_uses_escaped_like_pattern() {
+        let source = include_str!("tools.rs");
+
+        assert!(source.contains("ILIKE '%' || $3 || '%' ESCAPE '!'"));
+        assert!(
+            source.contains("SearchMode::IlikeFallback => escape_ilike_pattern(&request.query)")
+        );
+        assert!(source.contains(".bind(&search_query)"));
+    }
+
+    #[test]
+    fn tag_and_notebook_queries_filter_deleted_notes() {
+        let source = include_str!("tools.rs");
+
+        assert!(source.contains("AND notes.deleted_time IS NULL"));
+        assert!(source.contains("AND notes.parent_joplin_id = notebooks.joplin_id"));
+        assert!(source.contains("AND notes.joplin_id = edges.note_joplin_id"));
+        assert!(source.contains("AND edges.tag_joplin_id = $2"));
+    }
+
+    #[test]
+    fn advertised_tool_handlers_enforce_response_budget() {
+        let transport = include_str!("transport.rs");
+        let tools = include_str!("tools.rs");
+
+        for expected in [
+            "status_tool(mcp_pool, &scope, max_response_bytes)",
+            "list_notebooks_tool(mcp_pool, &scope, max_response_bytes)",
+            "list_tags_tool(mcp_pool, &scope, max_response_bytes)",
+            "get_notebook_tree_tool(mcp_pool, &scope, max_response_bytes)",
+            "get_notes_by_tag_tool(mcp_pool, &scope, &arguments, cursor_key, max_response_bytes)",
+        ] {
+            assert!(
+                transport.contains(expected),
+                "missing budgeted call: {expected}"
+            );
+        }
+        let direct_json_return = ["Ok", "(json!({"].concat();
+        assert!(
+            !tools.contains(&direct_json_return),
+            "tool handlers must call enforce_response_budget instead of returning JSON directly"
+        );
     }
 
     #[test]

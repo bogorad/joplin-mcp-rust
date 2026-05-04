@@ -1,4 +1,4 @@
-use crate::indexer::JoplinItemType;
+use crate::{db::pool as db_pool, indexer::JoplinItemType};
 use anyhow::Context;
 use async_trait::async_trait;
 use sqlx::{FromRow, PgPool};
@@ -231,13 +231,15 @@ impl JoplinSource for JoplinDbSource {
     ) -> anyhow::Result<Vec<JoplinItem>> {
         let after_updated_time = after.map(|cursor| cursor.updated_time);
         let after_id = after.map(|cursor| cursor.id.as_str());
+        let mut conn = db_pool::acquire_indexer(&self.pool).await?;
+
         let rows = sqlx::query_as::<_, RawJoplinItem>(CHANGED_ITEMS_BATCH_QUERY)
             .bind(user_id)
             .bind(since)
             .bind(after_updated_time)
             .bind(after_id)
             .bind(i64::from(limit.max(1)))
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *conn)
             .await
             .context("load changed Joplin item batch")?;
 
@@ -245,10 +247,12 @@ impl JoplinSource for JoplinDbSource {
     }
 
     async fn item_by_id(&self, user_id: &str, item_id: &str) -> anyhow::Result<Option<JoplinItem>> {
+        let mut conn = db_pool::acquire_indexer(&self.pool).await?;
+
         let row = sqlx::query_as::<_, RawJoplinItem>(ITEM_BY_ID_QUERY)
             .bind(user_id)
             .bind(item_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *conn)
             .await
             .context("load Joplin item by id")?;
 
@@ -256,9 +260,11 @@ impl JoplinSource for JoplinDbSource {
     }
 
     async fn active_item_refs(&self, user_id: &str) -> anyhow::Result<Option<Vec<JoplinItemRef>>> {
+        let mut conn = db_pool::acquire_indexer(&self.pool).await?;
+
         let rows = sqlx::query_as::<_, RawJoplinItemRef>(ACTIVE_ITEM_REFS_QUERY)
             .bind(user_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *conn)
             .await
             .context("load active Joplin item references")?;
 
@@ -276,9 +282,11 @@ impl JoplinSource for JoplinDbSource {
             return Ok(Vec::new());
         }
 
+        let mut conn = db_pool::acquire_indexer(&self.pool).await?;
+
         sqlx::query_as::<_, RawJoplinSourceWatermark>(SOURCE_WATERMARKS_QUERY)
             .bind(user_ids)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *conn)
             .await
             .context("load Joplin source watermarks")
             .map(|rows| {

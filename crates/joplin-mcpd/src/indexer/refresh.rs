@@ -1,13 +1,14 @@
 use crate::config::IndexConfig;
+use crate::db::pool as db_pool;
 use crate::indexer::JoplinItemType;
 use crate::indexer::item_content::parse_index_item;
 use crate::indexer::parser::{ParsedItem, extract_resource_refs};
-use crate::indexer::rebuild::{FullRebuildOutcome, IndexStatus, full_rebuild_user};
+use crate::indexer::rebuild::{FullRebuildOutcome, IndexStatus, full_rebuild_user_in_transaction};
 use crate::indexer::source::{JOPLIN_ITEM_BATCH_SIZE, JoplinItem, JoplinItemCursor, JoplinSource};
 use crate::observability::metrics;
 use anyhow::Context;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use sqlx::{FromRow, PgPool, Postgres, Transaction};
+use sqlx::{Acquire, FromRow, PgPool, Postgres, Transaction};
 use std::collections::HashSet;
 use std::time::Instant;
 use tracing::Instrument;
@@ -30,6 +31,7 @@ pub struct RefreshUser {
     pub last_incremental_at: Option<DateTime<Utc>>,
     pub last_full_rebuild_at: Option<DateTime<Utc>>,
     pub last_checked_at: Option<DateTime<Utc>>,
+    pub last_reconciled_at: Option<DateTime<Utc>>,
     pub last_seen_joplin_updated_time: Option<i64>,
 }
 
@@ -87,6 +89,7 @@ struct IncrementalRows {
     skipped_encrypted: usize,
     skipped_malformed: usize,
     skipped_wrong_owner: usize,
+    last_seen_joplin_updated_time: Option<i64>,
 }
 
 #[derive(Debug, Default)]
@@ -110,11 +113,16 @@ impl IncrementalTotals {
 }
 
 impl IncrementalRows {
+    fn record_seen(&mut self, updated_time: i64) {
+        self.last_seen_joplin_updated_time = Some(
+            self.last_seen_joplin_updated_time
+                .map_or(updated_time, |previous| previous.max(updated_time)),
+        );
+    }
+
     fn last_seen_joplin_updated_time(&self, previous: Option<i64>) -> Option<i64> {
-        self.active
-            .iter()
-            .map(|row| row.updated_time)
-            .chain(self.deleted.iter().map(|row| row.updated_time))
+        self.last_seen_joplin_updated_time
+            .into_iter()
             .chain(previous)
             .max()
     }
@@ -144,7 +152,6 @@ struct DeletedRow {
     joplin_id: String,
     item_type: JoplinItemType,
     deleted_time: Option<i64>,
-    updated_time: i64,
     note_joplin_id: Option<String>,
     tag_joplin_id: Option<String>,
 }
@@ -160,6 +167,10 @@ pub async fn due_refresh_users(
     config: &IndexConfig,
 ) -> anyhow::Result<Vec<RefreshUser>> {
     let limit = i64::from(config.max_parallel_users);
+    let mut conn = db_pool::acquire_runtime(mcp_pool)
+        .await
+        .context("acquire runtime database connection")?;
+
     sqlx::query_as::<_, RefreshUser>(
         r#"
         SELECT
@@ -169,6 +180,7 @@ pub async fn due_refresh_users(
             state.last_incremental_at,
             state.last_full_rebuild_at,
             state.last_checked_at,
+            state.last_reconciled_at,
             state.last_seen_joplin_updated_time
         FROM joplin_mcp.mcp_users users
         JOIN joplin_mcp.mcp_tokens tokens ON tokens.user_id = users.id
@@ -184,7 +196,7 @@ pub async fn due_refresh_users(
             OR state.last_full_rebuild_at IS NULL
             OR state.last_full_rebuild_at <= now() - ($3::bigint * interval '1 hour')
           )
-        GROUP BY users.id, users.joplin_user_id, state.status, state.last_incremental_at, state.last_full_rebuild_at, state.last_checked_at, state.last_seen_joplin_updated_time
+        GROUP BY users.id, users.joplin_user_id, state.status, state.last_incremental_at, state.last_full_rebuild_at, state.last_checked_at, state.last_reconciled_at, state.last_seen_joplin_updated_time
         ORDER BY state.last_checked_at ASC NULLS FIRST, users.id ASC
         LIMIT $2
         "#,
@@ -192,17 +204,21 @@ pub async fn due_refresh_users(
     .bind(config.refresh_interval_seconds as i64)
     .bind(limit)
     .bind(config.full_rebuild_interval_hours as i64)
-    .fetch_all(mcp_pool)
+    .fetch_all(&mut *conn)
     .await
         .context("load due refresh users")
 }
 
 pub async fn request_index_refresh_now(mcp_pool: &PgPool, user_id: Uuid) -> anyhow::Result<()> {
+    let mut conn = db_pool::acquire_runtime(mcp_pool)
+        .await
+        .context("acquire runtime database connection")?;
+
     sqlx::query(REQUEST_INDEX_REFRESH_NOW_SQL)
         .bind(user_id)
         .bind(IndexStatus::Empty.as_str())
         .bind(IndexStatus::Building.as_str())
-        .execute(mcp_pool)
+        .execute(&mut *conn)
         .await
         .context("request index refresh now")?;
 
@@ -229,6 +245,13 @@ pub fn refresh_needed(
         return true;
     }
 
+    if hard_delete_reconciliation_due(
+        user.last_reconciled_at,
+        config.hard_delete_reconcile_interval_hours,
+    ) {
+        return true;
+    }
+
     match (source_watermark, user.last_seen_joplin_updated_time) {
         (Some(source_watermark), Some(last_seen)) => source_watermark > last_seen,
         (Some(_), None) => true,
@@ -246,84 +269,95 @@ pub async fn incremental_refresh_user<S>(
 where
     S: JoplinSource,
 {
-    let started = Instant::now();
-    let span = tracing::info_span!("index.refresh");
-    let _entered = span.enter();
-    let lock_key = advisory_lock_key(user.mcp_user_id);
-    let mut tx = mcp_pool
-        .begin()
-        .await
-        .context("begin incremental refresh transaction")?;
-    let lock_acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
-        .bind(lock_key)
-        .fetch_one(tx.as_mut())
-        .await
-        .context("acquire user refresh advisory lock")?;
-
-    if !lock_acquired {
-        tx.rollback()
+    async {
+        let started = Instant::now();
+        let lock_key = advisory_lock_key(user.mcp_user_id);
+        let mut conn = db_pool::acquire_runtime(mcp_pool)
             .await
-            .context("rollback skipped refresh transaction")?;
-        metrics::record_index_refresh_duration("skipped_lock", started.elapsed());
-        return Ok(IncrementalRefreshOutcome::skipped_lock());
-    }
+            .context("acquire runtime database connection")?;
+        let mut tx = (&mut *conn)
+            .begin()
+            .await
+            .context("begin incremental refresh transaction")?;
+        let lock_acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+            .bind(lock_key)
+            .fetch_one(tx.as_mut())
+            .await
+            .context("acquire user refresh advisory lock")?;
 
-    let gap_seconds = refresh_gap_seconds(user.last_incremental_at);
-    if requires_full_rebuild(gap_seconds, config.incremental_lookback_max_seconds)
-        || full_rebuild_due(
-            user.last_full_rebuild_at,
-            config.full_rebuild_interval_hours,
-        )
-    {
-        let rebuild_outcome =
-            match full_rebuild_user(mcp_pool, source, user.mcp_user_id, &user.joplin_user_id)
-                .instrument(tracing::info_span!("index.full_rebuild"))
+        if !lock_acquired {
+            tx.rollback()
                 .await
+                .context("rollback skipped refresh transaction")?;
+            metrics::record_index_refresh_duration("skipped_lock", started.elapsed());
+            return Ok(IncrementalRefreshOutcome::skipped_lock());
+        }
+
+        let gap_seconds = refresh_gap_seconds(user.last_incremental_at);
+        if requires_full_rebuild(gap_seconds, config.incremental_lookback_max_seconds)
+            || full_rebuild_due(
+                user.last_full_rebuild_at,
+                config.full_rebuild_interval_hours,
+            )
+        {
+            let rebuild_outcome = match full_rebuild_user_in_transaction(
+                &mut tx,
+                source,
+                user.mcp_user_id,
+                &user.joplin_user_id,
+            )
+            .instrument(tracing::info_span!("index.full_rebuild"))
+            .await
             {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     tx.rollback()
                         .await
                         .context("release refresh lock after failed full rebuild")?;
+                    record_incremental_failure(mcp_pool, user.mcp_user_id, &error.to_string())
+                        .await?;
                     metrics::record_index_refresh_duration("failed", started.elapsed());
                     return Err(error);
                 }
             };
-        tx.commit()
-            .await
-            .context("release refresh lock after full rebuild")?;
-        metrics::record_index_refresh_duration("full_rebuild", started.elapsed());
-        return Ok(IncrementalRefreshOutcome::from_full_rebuild(
-            rebuild_outcome,
-        ));
-    }
-
-    mark_stale_if_needed(
-        &mut tx,
-        user.mcp_user_id,
-        user.last_incremental_at,
-        config.refresh_interval_seconds,
-    )
-    .await?;
-
-    let result = apply_incremental_refresh(&mut tx, source, user, config).await;
-    match result {
-        Ok(outcome) => {
             tx.commit()
                 .await
-                .context("commit incremental refresh transaction")?;
-            metrics::record_index_refresh_duration("success", started.elapsed());
-            Ok(outcome)
+                .context("release refresh lock after full rebuild")?;
+            metrics::record_index_refresh_duration("full_rebuild", started.elapsed());
+            return Ok(IncrementalRefreshOutcome::from_full_rebuild(
+                rebuild_outcome,
+            ));
         }
-        Err(error) => {
-            tx.rollback()
-                .await
-                .context("rollback failed incremental refresh transaction")?;
-            record_incremental_failure(mcp_pool, user.mcp_user_id, &error.to_string()).await?;
-            metrics::record_index_refresh_duration("failed", started.elapsed());
-            Err(error)
+
+        mark_stale_if_needed(
+            &mut tx,
+            user.mcp_user_id,
+            user.last_incremental_at,
+            config.refresh_interval_seconds,
+        )
+        .await?;
+
+        let result = apply_incremental_refresh(&mut tx, source, user, config).await;
+        match result {
+            Ok(outcome) => {
+                tx.commit()
+                    .await
+                    .context("commit incremental refresh transaction")?;
+                metrics::record_index_refresh_duration("success", started.elapsed());
+                Ok(outcome)
+            }
+            Err(error) => {
+                tx.rollback()
+                    .await
+                    .context("rollback failed incremental refresh transaction")?;
+                record_incremental_failure(mcp_pool, user.mcp_user_id, &error.to_string()).await?;
+                metrics::record_index_refresh_duration("failed", started.elapsed());
+                Err(error)
+            }
         }
     }
+    .instrument(tracing::info_span!("index.refresh"))
+    .await
 }
 
 async fn apply_incremental_refresh<S>(
@@ -376,7 +410,13 @@ where
         }
     }
 
-    totals.reconciled_deleted_items = reconcile_hard_deletes(tx, source, user).await?;
+    let reconcile_due = hard_delete_reconciliation_due(
+        user.last_reconciled_at,
+        config.hard_delete_reconcile_interval_hours,
+    );
+    if reconcile_due {
+        totals.reconciled_deleted_items = reconcile_hard_deletes(tx, source, user).await?;
+    }
     let last_seen = totals
         .last_seen_joplin_updated_time
         .or(user.last_seen_joplin_updated_time);
@@ -386,6 +426,7 @@ where
         last_seen,
         config.refresh_interval_seconds,
         totals.changed_items > 0 || totals.reconciled_deleted_items > 0,
+        reconcile_due,
     )
     .instrument(tracing::info_span!("index.state_update"))
     .await?;
@@ -410,6 +451,7 @@ fn build_incremental_rows(joplin_user_id: &str, items: Vec<JoplinItem>) -> Incre
     let mut rows = IncrementalRows::default();
 
     for item in items {
+        rows.record_seen(item.updated_time);
         if item.owner_id != joplin_user_id {
             rows.skipped_wrong_owner += 1;
             continue;
@@ -439,7 +481,6 @@ fn build_incremental_rows(joplin_user_id: &str, items: Vec<JoplinItem>) -> Incre
                 joplin_id: item.jop_id,
                 item_type: item.item_type,
                 deleted_time: Some(deleted_time),
-                updated_time: item.updated_time.max(deleted_time),
                 note_joplin_id: string_metadata(&parsed, "note_id"),
                 tag_joplin_id: string_metadata(&parsed, "tag_id"),
             });
@@ -585,13 +626,14 @@ async fn mark_incremental_ready(
     last_seen_joplin_updated_time: Option<i64>,
     refresh_interval_seconds: u64,
     applied_changes: bool,
+    ran_hard_delete_reconciliation: bool,
 ) -> anyhow::Result<()> {
     let _ = refresh_interval_seconds;
     sqlx::query(
         r#"
         INSERT INTO joplin_mcp.index_state
-            (user_id, status, last_checked_at, last_incremental_at, last_seen_joplin_updated_time, updated_at)
-        VALUES ($1, $2, now(), CASE WHEN $4 THEN now() ELSE NULL END, $3, now())
+            (user_id, status, last_checked_at, last_incremental_at, last_seen_joplin_updated_time, last_reconciled_at, updated_at)
+        VALUES ($1, $2, now(), CASE WHEN $4 THEN now() ELSE NULL END, $3, CASE WHEN $5 THEN now() ELSE NULL END, now())
         ON CONFLICT (user_id) DO UPDATE
         SET status = EXCLUDED.status,
             last_checked_at = EXCLUDED.last_checked_at,
@@ -607,6 +649,10 @@ async fn mark_incremental_ready(
                 joplin_mcp.index_state.last_seen_joplin_updated_time,
                 EXCLUDED.last_seen_joplin_updated_time
             ),
+            last_reconciled_at = CASE
+                WHEN $5 THEN EXCLUDED.last_reconciled_at
+                ELSE joplin_mcp.index_state.last_reconciled_at
+            END,
             last_error = NULL,
             updated_at = now()
         "#,
@@ -615,6 +661,7 @@ async fn mark_incremental_ready(
     .bind(IndexStatus::Ready.as_str())
     .bind(last_seen_joplin_updated_time)
     .bind(applied_changes)
+    .bind(ran_hard_delete_reconciliation)
     .execute(tx.as_mut())
     .await
     .context("mark incremental refresh ready")?;
@@ -627,6 +674,10 @@ pub async fn mark_index_checked(
     user_id: Uuid,
     source_watermark: Option<i64>,
 ) -> anyhow::Result<()> {
+    let mut conn = db_pool::acquire_runtime(mcp_pool)
+        .await
+        .context("acquire runtime database connection")?;
+
     sqlx::query(
         r#"
         INSERT INTO joplin_mcp.index_state
@@ -650,7 +701,7 @@ pub async fn mark_index_checked(
     .bind(user_id)
     .bind(IndexStatus::Ready.as_str())
     .bind(source_watermark)
-    .execute(mcp_pool)
+    .execute(&mut *conn)
     .await
     .context("mark index checked")?;
 
@@ -662,6 +713,10 @@ async fn record_incremental_failure(
     user_id: Uuid,
     error: &str,
 ) -> anyhow::Result<()> {
+    let mut conn = db_pool::acquire_runtime(mcp_pool)
+        .await
+        .context("acquire runtime database connection")?;
+
     sqlx::query(
         r#"
         INSERT INTO joplin_mcp.index_state (user_id, status, last_error, updated_at)
@@ -678,7 +733,7 @@ async fn record_incremental_failure(
     .bind(user_id)
     .bind(IndexStatus::Failed.as_str())
     .bind(error)
-    .execute(mcp_pool)
+    .execute(&mut *conn)
     .await
     .context("record incremental refresh failure")?;
 
@@ -962,7 +1017,6 @@ where
             joplin_id: item.joplin_id,
             item_type,
             deleted_time: None,
-            updated_time: 0,
             note_joplin_id: None,
             tag_joplin_id: None,
         };
@@ -1007,6 +1061,17 @@ pub fn full_rebuild_due(last_full_rebuild_at: Option<DateTime<Utc>>, interval_ho
         return true;
     };
     Utc::now().signed_duration_since(last_full_rebuild_at)
+        >= ChronoDuration::hours(interval_hours as i64)
+}
+
+pub fn hard_delete_reconciliation_due(
+    last_reconciled_at: Option<DateTime<Utc>>,
+    interval_hours: u64,
+) -> bool {
+    let Some(last_reconciled_at) = last_reconciled_at else {
+        return true;
+    };
+    Utc::now().signed_duration_since(last_reconciled_at)
         >= ChronoDuration::hours(interval_hours as i64)
 }
 
@@ -1120,6 +1185,30 @@ mod tests {
     }
 
     #[test]
+    fn hard_delete_reconciliation_uses_separate_cadence() {
+        assert!(hard_delete_reconciliation_due(None, 24));
+        assert!(hard_delete_reconciliation_due(
+            Some(Utc::now() - Duration::hours(24)),
+            24
+        ));
+        assert!(!hard_delete_reconciliation_due(
+            Some(Utc::now() - Duration::hours(23)),
+            24
+        ));
+    }
+
+    #[test]
+    fn refresh_span_does_not_hold_enter_guard_across_awaits() {
+        let source = include_str!("refresh.rs");
+        let enter_guard = ["span", ".enter()"].concat();
+        let guard_name = ["_", "entered"].concat();
+
+        assert!(source.contains(".instrument(tracing::info_span!(\"index.refresh\"))"));
+        assert!(!source.contains(&enter_guard));
+        assert!(!source.contains(&guard_name));
+    }
+
+    #[test]
     fn stale_state_uses_twice_refresh_interval() {
         assert!(is_stale(Some(Utc::now() - Duration::seconds(121)), 60));
         assert!(!is_stale(Some(Utc::now() - Duration::seconds(120)), 60));
@@ -1159,7 +1248,7 @@ mod tests {
             rows.active[0].parent_joplin_id.as_deref(),
             Some("notebook1")
         );
-        assert_eq!(rows.last_seen_joplin_updated_time(Some(1)), Some(2));
+        assert_eq!(rows.last_seen_joplin_updated_time(Some(1)), Some(20));
     }
 
     #[test]
@@ -1178,7 +1267,7 @@ mod tests {
         assert_eq!(rows.deleted.len(), 1);
         assert_eq!(rows.deleted[0].joplin_id, "deleted-note");
         assert_eq!(rows.deleted[0].deleted_time, Some(55));
-        assert_eq!(rows.last_seen_joplin_updated_time(Some(1)), Some(55));
+        assert_eq!(rows.last_seen_joplin_updated_time(Some(1)), Some(20));
     }
 
     #[test]
@@ -1207,28 +1296,24 @@ mod tests {
     fn skips_encrypted_wrong_owner_and_malformed_changes() {
         let mut encrypted = item("owner", "encrypted", JoplinItemType::Note, "");
         encrypted.encrypted = true;
-        let rows = build_incremental_rows(
-            "owner",
-            vec![
-                encrypted,
-                item(
-                    "other",
-                    "other-note",
-                    JoplinItemType::Note,
-                    &content("Other", "", 1, ""),
-                ),
-                {
-                    let mut item = item("owner", "bad", JoplinItemType::Note, "");
-                    item.content = vec![0xff];
-                    item
-                },
-            ],
+        encrypted.updated_time = 30;
+        let mut wrong_owner = item(
+            "other",
+            "other-note",
+            JoplinItemType::Note,
+            &content("Other", "", 1, ""),
         );
+        wrong_owner.updated_time = 40;
+        let mut malformed = item("owner", "bad", JoplinItemType::Note, "");
+        malformed.content = vec![0xff];
+        malformed.updated_time = 50;
+        let rows = build_incremental_rows("owner", vec![encrypted, wrong_owner, malformed]);
 
         assert!(rows.active.is_empty());
         assert_eq!(rows.skipped_encrypted, 1);
         assert_eq!(rows.skipped_wrong_owner, 1);
         assert_eq!(rows.skipped_malformed, 1);
+        assert_eq!(rows.last_seen_joplin_updated_time(Some(1)), Some(50));
     }
 
     #[test]
@@ -1306,6 +1391,7 @@ mod tests {
             state.last_incremental_at,
             state.last_full_rebuild_at,
             state.last_checked_at,
+            state.last_reconciled_at,
             state.last_seen_joplin_updated_time
         FROM joplin_mcp.mcp_users users
         JOIN joplin_mcp.mcp_tokens tokens ON tokens.user_id = users.id
@@ -1339,11 +1425,34 @@ mod tests {
             last_incremental_at: Some(Utc::now()),
             last_full_rebuild_at: Some(Utc::now()),
             last_checked_at: Some(Utc::now()),
+            last_reconciled_at: Some(Utc::now()),
             last_seen_joplin_updated_time: Some(10),
         };
 
         assert!(!refresh_needed(&user, Some(10), &config));
         assert!(refresh_needed(&user, Some(11), &config));
+    }
+
+    #[test]
+    fn refresh_needed_runs_when_hard_delete_reconciliation_is_due() {
+        let config = IndexConfig::default();
+        let mut user = RefreshUser {
+            mcp_user_id: Uuid::new_v4(),
+            joplin_user_id: "joplin-user".to_string(),
+            status: Some("ready".to_string()),
+            last_incremental_at: Some(Utc::now()),
+            last_full_rebuild_at: Some(Utc::now()),
+            last_checked_at: Some(Utc::now()),
+            last_reconciled_at: Some(Utc::now()),
+            last_seen_joplin_updated_time: Some(10),
+        };
+
+        assert!(!refresh_needed(&user, Some(10), &config));
+        user.last_reconciled_at =
+            Some(Utc::now() - Duration::hours(config.hard_delete_reconcile_interval_hours as i64));
+        assert!(refresh_needed(&user, Some(10), &config));
+        user.last_reconciled_at = None;
+        assert!(refresh_needed(&user, Some(10), &config));
     }
 
     #[test]
@@ -1356,6 +1465,7 @@ mod tests {
             last_incremental_at: Some(Utc::now()),
             last_full_rebuild_at: Some(Utc::now()),
             last_checked_at: Some(Utc::now()),
+            last_reconciled_at: Some(Utc::now()),
             last_seen_joplin_updated_time: None,
         };
 

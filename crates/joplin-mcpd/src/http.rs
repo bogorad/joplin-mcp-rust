@@ -8,7 +8,10 @@ use crate::{
     },
     config::{BootstrapRateLimitConfig, Config},
     contracts::MCP_PROTOCOL_VERSION,
-    db::audit::{AuditEventType, AuditOutcome, AuditRecord, write_audit_log},
+    db::{
+        audit::{AuditEventType, AuditOutcome, AuditRecord, write_audit_log},
+        pool as db_pool,
+    },
     indexer::refresh::request_index_refresh_now,
     lifecycle::{Readiness, ReadinessStatus, RemoteIp, ShutdownDrain, extract_client_ip},
     mcp::transport::{McpAuth, mcp_delete, mcp_get, mcp_post},
@@ -434,10 +437,6 @@ fn allow_windowed_request(
         window_start: now,
         count: 0,
     });
-    if now.duration_since(counter.window_start) >= window {
-        counter.window_start = now;
-        counter.count = 0;
-    }
     if counter.count >= limit {
         return false;
     }
@@ -855,6 +854,18 @@ async fn index_status(State(state): State<AppState>, headers: HeaderMap) -> Resp
     let Ok(token) = authenticate_api_token(&state, &headers).await else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
+    let mut conn = match db_pool::acquire_runtime(mcp_pool).await {
+        Ok(conn) => conn,
+        Err(error) => {
+            tracing::warn!(
+                operation = "index_status",
+                outcome = "failed",
+                error = %error,
+                "failed to acquire runtime database connection"
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
     let row = match sqlx::query_as::<_, IndexStatusRow>(
         r#"
         SELECT status, last_full_rebuild_at, last_incremental_at, last_checked_at, updated_at
@@ -863,7 +874,7 @@ async fn index_status(State(state): State<AppState>, headers: HeaderMap) -> Resp
         "#,
     )
     .bind(token.user_id)
-    .fetch_optional(mcp_pool)
+    .fetch_optional(&mut *conn)
     .await
     {
         Ok(row) => row,
@@ -1131,6 +1142,7 @@ mod tests {
             .oneshot(
                 Request::post("/login")
                     .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .header(header::ORIGIN, "http://127.0.0.1:8081")
                     .body(Body::from("email=user%40example.test"))
                     .expect("request"),
             )
@@ -1156,6 +1168,7 @@ mod tests {
                 .oneshot(
                     Request::post("/login")
                         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                        .header(header::ORIGIN, "http://127.0.0.1:8081")
                         .body(Body::from("email=user%40example.test"))
                         .expect("request"),
                 )
@@ -1221,9 +1234,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_post_rejects_disallowed_origin_and_referer() {
+    async fn login_post_rejects_missing_or_disallowed_browser_provenance() {
         let app = router(Config::default(), Readiness::new(ReadinessStatus::Ready));
 
+        let missing_response = app
+            .clone()
+            .oneshot(
+                Request::post("/login")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(
+                        "email=user%40example.test&password=secret&client_label=browser",
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
         let origin_response = app
             .clone()
             .oneshot(
@@ -1250,6 +1275,7 @@ mod tests {
             .await
             .expect("response");
 
+        assert_eq!(missing_response.status(), StatusCode::FORBIDDEN);
         assert_eq!(origin_response.status(), StatusCode::FORBIDDEN);
         assert_eq!(referer_response.status(), StatusCode::FORBIDDEN);
     }
@@ -1428,7 +1454,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_rate_limiter_prunes_expired_ip_and_email_keys() {
+    fn bootstrap_rate_limiter_resets_expired_windows_by_pruning_keys() {
         let limiter = BootstrapRateLimiter::new();
         let config = BootstrapRateLimitConfig {
             per_ip_per_minute: 10,
@@ -1455,15 +1481,20 @@ mod tests {
 
         assert!(
             limiter
-                .check(Some("192.0.2.101"), "fresh@example.test", &config)
+                .check(Some("192.0.2.100"), "stale@example.test", &config)
                 .is_ok()
         );
 
         let state = limiter.inner.lock().expect("limiter state");
-        assert!(!state.per_ip.contains_key("192.0.2.100"));
-        assert!(!state.per_email.contains_key("stale@example.test"));
-        assert!(state.per_ip.contains_key("192.0.2.101"));
-        assert!(state.per_email.contains_key("fresh@example.test"));
+        let ip_counter = state.per_ip.get("192.0.2.100").expect("fresh IP window");
+        let email_counter = state
+            .per_email
+            .get("stale@example.test")
+            .expect("fresh email window");
+        assert!(ip_counter.window_start > stale_start);
+        assert_eq!(ip_counter.count, 1);
+        assert!(email_counter.window_start > stale_start);
+        assert_eq!(email_counter.count, 1);
     }
 
     #[test]

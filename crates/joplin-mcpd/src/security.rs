@@ -125,16 +125,23 @@ fn validate_login_post(
     headers: &HeaderMap,
     allowed_origins: &[String],
 ) -> Result<(), OriginPolicyError> {
-    if let Some(origin) = headers.get(header::ORIGIN)
+    let origin = headers.get(header::ORIGIN);
+    let referer = headers.get(header::REFERER);
+
+    if let Some(origin) = origin
         && !allowed_origin_header(origin.to_str().ok(), allowed_origins)
     {
         return Err(OriginPolicyError::DisallowedOrigin);
     }
 
-    if let Some(referer) = headers.get(header::REFERER)
+    if let Some(referer) = referer
         && !allowed_referer_header(referer.to_str().ok(), allowed_origins)
     {
         return Err(OriginPolicyError::DisallowedReferer);
+    }
+
+    if origin.is_none() && referer.is_none() {
+        return Err(OriginPolicyError::DisallowedOrigin);
     }
 
     Ok(())
@@ -321,6 +328,33 @@ mod tests {
             validate_origin_policy(EndpointClass::LoginPost, &headers, &allowed()),
             Err(OriginPolicyError::DisallowedReferer)
         );
+    }
+
+    #[test]
+    fn login_post_requires_origin_or_referer() {
+        assert_eq!(
+            validate_origin_policy(EndpointClass::LoginPost, &HeaderMap::new(), &allowed()),
+            Err(OriginPolicyError::DisallowedOrigin)
+        );
+    }
+
+    #[test]
+    fn login_post_allows_origin_or_referer() {
+        let mut origin_headers = HeaderMap::new();
+        origin_headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://joplin-mcp.lan"),
+        );
+        validate_origin_policy(EndpointClass::LoginPost, &origin_headers, &allowed())
+            .expect("allowed origin accepted");
+
+        let mut referer_headers = HeaderMap::new();
+        referer_headers.insert(
+            header::REFERER,
+            HeaderValue::from_static("https://joplin-mcp.lan/login"),
+        );
+        validate_origin_policy(EndpointClass::LoginPost, &referer_headers, &allowed())
+            .expect("allowed referer accepted");
     }
 
     #[test]

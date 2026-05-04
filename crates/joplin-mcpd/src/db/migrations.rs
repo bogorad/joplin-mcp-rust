@@ -1,3 +1,6 @@
+use crate::db::pool as db_pool;
+use anyhow::Context;
+
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 pub const PERSISTENT_MCP_TABLES: &[&str] = &["mcp_users", "mcp_tokens", "audit_log"];
@@ -43,9 +46,13 @@ pub async fn ensure_database_not_newer_than_binary(pool: &sqlx::PgPool) -> anyho
 }
 
 async fn highest_applied_version(pool: &sqlx::PgPool) -> anyhow::Result<Option<i64>> {
+    let mut conn = db_pool::acquire_runtime(pool)
+        .await
+        .context("acquire runtime database connection")?;
+
     let migrations_table: Option<String> =
         sqlx::query_scalar("SELECT to_regclass('public._sqlx_migrations')::text")
-            .fetch_one(pool)
+            .fetch_one(&mut *conn)
             .await?;
 
     if migrations_table.is_none() {
@@ -53,7 +60,7 @@ async fn highest_applied_version(pool: &sqlx::PgPool) -> anyhow::Result<Option<i
     }
 
     let version = sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations")
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await?;
     Ok(version)
 }
@@ -81,22 +88,24 @@ mod tests {
     const INITIAL_SQL: &str = include_str!("../../migrations/20260504000100_initial.sql");
     const LAST_CHECKED_SQL: &str =
         include_str!("../../migrations/20260504000101_add_last_checked_at.sql");
+    const LAST_RECONCILED_SQL: &str =
+        include_str!("../../migrations/20260504000102_add_last_reconciled_at.sql");
 
     #[test]
     fn embedded_migration_version_is_present() {
-        assert_eq!(latest_embedded_version(), 20260504000101);
+        assert_eq!(latest_embedded_version(), 20260504000102);
     }
 
     #[test]
     fn rejects_newer_applied_database_version() {
         let error =
-            ensure_applied_version_supported(Some(20260504000102), latest_embedded_version())
+            ensure_applied_version_supported(Some(20260504000103), latest_embedded_version())
                 .expect_err("newer database must be rejected");
         assert_eq!(
             error,
             MigrationVersionError::DatabaseNewerThanBinary {
-                applied_version: 20260504000102,
-                embedded_version: 20260504000101
+                applied_version: 20260504000103,
+                embedded_version: 20260504000102
             }
         );
     }
@@ -108,6 +117,8 @@ mod tests {
         ensure_applied_version_supported(Some(20260504000100), latest_embedded_version())
             .expect("current database is valid");
         ensure_applied_version_supported(Some(20260504000101), latest_embedded_version())
+            .expect("current database is valid");
+        ensure_applied_version_supported(Some(20260504000102), latest_embedded_version())
             .expect("current database is valid");
     }
 
@@ -170,6 +181,14 @@ mod tests {
     fn last_checked_migration_declares_index_poll_state() {
         assert!(LAST_CHECKED_SQL.contains("ALTER TABLE joplin_mcp.index_state"));
         assert!(LAST_CHECKED_SQL.contains("ADD COLUMN IF NOT EXISTS last_checked_at timestamptz"));
+    }
+
+    #[test]
+    fn last_reconciled_migration_declares_hard_delete_cadence_state() {
+        assert!(LAST_RECONCILED_SQL.contains("ALTER TABLE joplin_mcp.index_state"));
+        assert!(
+            LAST_RECONCILED_SQL.contains("ADD COLUMN IF NOT EXISTS last_reconciled_at timestamptz")
+        );
     }
 
     #[test]

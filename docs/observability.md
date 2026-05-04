@@ -10,7 +10,7 @@ This document records the v1 metric, trace, and alert contract. Labels must stay
 - `mcp_tool_duration_seconds`: histogram by `tool`.
 - `mcp_tool_errors_total`: counter by `tool` and `error.kind`.
 - `bootstrap_login_total`: counter by `outcome`.
-- `postgres_pool_wait_seconds`: histogram by `pool`.
+- `postgres_pool_wait_seconds`: histogram of Postgres connection acquisition wait by `pool`; allowed pools are `runtime` and `indexer`.
 
 ## Trace Spans
 

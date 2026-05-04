@@ -1,9 +1,11 @@
+use crate::db::pool as db_pool;
 use crate::indexer::JoplinItemType;
 use crate::indexer::item_content::parse_index_item;
 use crate::indexer::parser::{ParsedItem, extract_resource_refs};
 use crate::indexer::source::{JOPLIN_ITEM_BATCH_SIZE, JoplinItem, JoplinItemCursor, JoplinSource};
 use anyhow::Context;
-use sqlx::{PgPool, Postgres, QueryBuilder};
+use sqlx::{Acquire, PgPool, Postgres, QueryBuilder, Transaction};
+#[cfg(test)]
 use std::collections::HashSet;
 use uuid::Uuid;
 
@@ -54,9 +56,18 @@ struct RebuildRows {
     skipped_encrypted: usize,
     skipped_malformed: usize,
     skipped_wrong_owner: usize,
+    last_seen_joplin_updated_time: Option<i64>,
 }
 
 impl RebuildRows {
+    fn record_seen(&mut self, updated_time: i64) {
+        self.last_seen_joplin_updated_time = Some(
+            self.last_seen_joplin_updated_time
+                .map_or(updated_time, |previous| previous.max(updated_time)),
+        );
+    }
+
+    #[cfg(test)]
     fn outcome(&self) -> FullRebuildOutcome {
         FullRebuildOutcome {
             indexed_notes: self.notes.len(),
@@ -72,15 +83,54 @@ impl RebuildRows {
     }
 
     fn last_seen_joplin_updated_time(&self) -> Option<i64> {
-        self.notes
-            .iter()
-            .map(|row| row.updated_time)
-            .chain(self.notebooks.iter().map(|row| row.updated_time))
-            .chain(self.tags.iter().map(|row| row.updated_time))
-            .chain(self.note_tags.iter().map(|row| row.updated_time))
-            .chain(self.resources.iter().map(|row| row.updated_time))
-            .chain(self.deleted_items.iter().filter_map(|row| row.deleted_time))
-            .max()
+        self.last_seen_joplin_updated_time
+    }
+}
+
+#[derive(Debug, Default)]
+struct RebuildStats {
+    indexed_notes: usize,
+    indexed_notebooks: usize,
+    indexed_tags: usize,
+    indexed_note_tags: usize,
+    indexed_resources: usize,
+    indexed_deleted_items: usize,
+    skipped_encrypted: usize,
+    skipped_malformed: usize,
+    skipped_wrong_owner: usize,
+    last_seen_joplin_updated_time: Option<i64>,
+}
+
+impl RebuildStats {
+    fn add_rows(&mut self, rows: &RebuildRows) {
+        self.indexed_notes += rows.notes.len();
+        self.indexed_notebooks += rows.notebooks.len();
+        self.indexed_tags += rows.tags.len();
+        self.indexed_note_tags += rows.note_tags.len();
+        self.indexed_resources += rows.resources.len();
+        self.indexed_deleted_items += rows.deleted_items.len();
+        self.skipped_encrypted += rows.skipped_encrypted;
+        self.skipped_malformed += rows.skipped_malformed;
+        self.skipped_wrong_owner += rows.skipped_wrong_owner;
+        self.last_seen_joplin_updated_time = rows
+            .last_seen_joplin_updated_time()
+            .into_iter()
+            .chain(self.last_seen_joplin_updated_time)
+            .max();
+    }
+
+    fn outcome(&self) -> FullRebuildOutcome {
+        FullRebuildOutcome {
+            indexed_notes: self.indexed_notes,
+            indexed_notebooks: self.indexed_notebooks,
+            indexed_tags: self.indexed_tags,
+            indexed_note_tags: self.indexed_note_tags,
+            indexed_resources: self.indexed_resources,
+            indexed_deleted_items: self.indexed_deleted_items,
+            skipped_encrypted: self.skipped_encrypted,
+            skipped_malformed: self.skipped_malformed,
+            skipped_wrong_owner: self.skipped_wrong_owner,
+        }
     }
 }
 
@@ -154,29 +204,19 @@ where
         .context("check previous index state")?;
 
     let result: anyhow::Result<FullRebuildOutcome> = async {
-        let mut rows = RebuildRows::default();
-        let mut after = None;
-
-        loop {
-            let items = source
-                .changed_items_batch(joplin_user_id, None, after.as_ref(), JOPLIN_ITEM_BATCH_SIZE)
-                .await
-                .context("load Joplin item batch for full rebuild")?;
-            if items.is_empty() {
-                break;
-            }
-
-            let batch_len = items.len();
-            after = items.last().map(JoplinItemCursor::from);
-            append_rebuild_rows(&mut rows, joplin_user_id, items);
-            if batch_len < JOPLIN_ITEM_BATCH_SIZE as usize {
-                break;
-            }
-        }
-
-        prune_dangling_note_tags(&mut rows);
-        replace_derived_rows(mcp_pool, mcp_user_id, &rows).await?;
-        Ok(rows.outcome())
+        let mut conn = db_pool::acquire_runtime(mcp_pool)
+            .await
+            .context("acquire runtime database connection")?;
+        let mut tx = (&mut *conn)
+            .begin()
+            .await
+            .context("begin full rebuild transaction")?;
+        let outcome =
+            full_rebuild_user_in_transaction(&mut tx, source, mcp_user_id, joplin_user_id).await?;
+        tx.commit()
+            .await
+            .context("commit full rebuild transaction")?;
+        Ok(outcome)
     }
     .await;
 
@@ -191,16 +231,62 @@ where
     }
 }
 
+pub(crate) async fn full_rebuild_user_in_transaction<S>(
+    tx: &mut Transaction<'_, Postgres>,
+    source: &S,
+    mcp_user_id: Uuid,
+    joplin_user_id: &str,
+) -> anyhow::Result<FullRebuildOutcome>
+where
+    S: JoplinSource,
+{
+    prepare_derived_rows_for_rebuild(tx, mcp_user_id).await?;
+
+    let mut stats = RebuildStats::default();
+    let mut after = None;
+
+    loop {
+        let items = source
+            .changed_items_batch(joplin_user_id, None, after.as_ref(), JOPLIN_ITEM_BATCH_SIZE)
+            .await
+            .context("load Joplin item batch for full rebuild")?;
+        if items.is_empty() {
+            break;
+        }
+
+        let batch_len = items.len();
+        after = items.last().map(JoplinItemCursor::from);
+        let rows = rebuild_rows_for_items(joplin_user_id, items);
+        insert_rebuild_rows(tx, mcp_user_id, &rows).await?;
+        stats.add_rows(&rows);
+        if batch_len < JOPLIN_ITEM_BATCH_SIZE as usize {
+            break;
+        }
+    }
+
+    prune_dangling_note_tags_in_db(tx, mcp_user_id).await?;
+    stats.indexed_note_tags = count_note_tags(tx, mcp_user_id).await?;
+    mark_rebuild_ready(tx, mcp_user_id, stats.last_seen_joplin_updated_time).await?;
+
+    Ok(stats.outcome())
+}
+
 #[cfg(test)]
 fn build_rebuild_rows(joplin_user_id: &str, items: Vec<JoplinItem>) -> RebuildRows {
+    let mut rows = rebuild_rows_for_items(joplin_user_id, items);
+    prune_dangling_note_tags(&mut rows);
+    rows
+}
+
+fn rebuild_rows_for_items(joplin_user_id: &str, items: Vec<JoplinItem>) -> RebuildRows {
     let mut rows = RebuildRows::default();
     append_rebuild_rows(&mut rows, joplin_user_id, items);
-    prune_dangling_note_tags(&mut rows);
     rows
 }
 
 fn append_rebuild_rows(rows: &mut RebuildRows, joplin_user_id: &str, items: Vec<JoplinItem>) {
     for item in items {
+        rows.record_seen(item.updated_time);
         if item.owner_id != joplin_user_id {
             rows.skipped_wrong_owner += 1;
             continue;
@@ -286,16 +372,10 @@ fn append_rebuild_rows(rows: &mut RebuildRows, joplin_user_id: &str, items: Vec<
     }
 }
 
-async fn replace_derived_rows(
-    mcp_pool: &PgPool,
+async fn prepare_derived_rows_for_rebuild(
+    tx: &mut Transaction<'_, Postgres>,
     user_id: Uuid,
-    rows: &RebuildRows,
 ) -> anyhow::Result<()> {
-    let mut tx = mcp_pool
-        .begin()
-        .await
-        .context("begin full rebuild transaction")?;
-
     sqlx::query(
         r#"
         INSERT INTO joplin_mcp.index_state (user_id, status, updated_at)
@@ -319,13 +399,28 @@ async fn replace_derived_rows(
             .context("delete previous derived index rows")?;
     }
 
-    insert_notebooks(&mut tx, user_id, &rows.notebooks).await?;
-    insert_notes(&mut tx, user_id, &rows.notes).await?;
-    insert_tags(&mut tx, user_id, &rows.tags).await?;
-    insert_note_tags(&mut tx, user_id, &rows.note_tags).await?;
-    insert_resources(&mut tx, user_id, &rows.resources).await?;
-    insert_deleted_items(&mut tx, user_id, &rows.deleted_items).await?;
+    Ok(())
+}
 
+async fn insert_rebuild_rows(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+    rows: &RebuildRows,
+) -> anyhow::Result<()> {
+    insert_notebooks(tx, user_id, &rows.notebooks).await?;
+    insert_notes(tx, user_id, &rows.notes).await?;
+    insert_tags(tx, user_id, &rows.tags).await?;
+    insert_note_tags(tx, user_id, &rows.note_tags).await?;
+    insert_resources(tx, user_id, &rows.resources).await?;
+    insert_deleted_items(tx, user_id, &rows.deleted_items).await?;
+    Ok(())
+}
+
+async fn mark_rebuild_ready(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+    last_seen_joplin_updated_time: Option<i64>,
+) -> anyhow::Result<()> {
     sqlx::query(
         r#"
         UPDATE joplin_mcp.index_state
@@ -334,6 +429,7 @@ async fn replace_derived_rows(
             last_incremental_at = now(),
             last_checked_at = now(),
             last_seen_joplin_updated_time = $3,
+            last_reconciled_at = now(),
             last_error = NULL,
             updated_at = now()
         WHERE user_id = $1
@@ -341,15 +437,58 @@ async fn replace_derived_rows(
     )
     .bind(user_id)
     .bind(IndexStatus::Ready.as_str())
-    .bind(rows.last_seen_joplin_updated_time())
+    .bind(last_seen_joplin_updated_time)
     .execute(tx.as_mut())
     .await
     .context("mark index ready")?;
 
-    tx.commit()
-        .await
-        .context("commit full rebuild transaction")?;
     Ok(())
+}
+
+async fn prune_dangling_note_tags_in_db(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        DELETE FROM joplin_mcp.note_tags_index edges
+        WHERE edges.user_id = $1
+          AND (
+            NOT EXISTS (
+                SELECT 1
+                FROM joplin_mcp.notes_index notes
+                WHERE notes.user_id = edges.user_id
+                  AND notes.joplin_id = edges.note_joplin_id
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM joplin_mcp.tags_index tags
+                WHERE tags.user_id = edges.user_id
+                  AND tags.joplin_id = edges.tag_joplin_id
+            )
+          )
+        "#,
+    )
+    .bind(user_id)
+    .execute(tx.as_mut())
+    .await
+    .context("prune dangling note tag edges")?;
+
+    Ok(())
+}
+
+async fn count_note_tags(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+) -> anyhow::Result<usize> {
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM joplin_mcp.note_tags_index WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(tx.as_mut())
+            .await
+            .context("count rebuilt note tag edges")?;
+
+    Ok(count as usize)
 }
 
 const DELETE_DERIVED_ROWS_SQL: &[&str] = &[
@@ -545,10 +684,14 @@ async fn insert_deleted_items(
 }
 
 async fn has_servable_index(mcp_pool: &PgPool, user_id: Uuid) -> anyhow::Result<bool> {
+    let mut conn = db_pool::acquire_runtime(mcp_pool)
+        .await
+        .context("acquire runtime database connection")?;
+
     let status: Option<String> =
         sqlx::query_scalar("SELECT status FROM joplin_mcp.index_state WHERE user_id = $1")
             .bind(user_id)
-            .fetch_optional(mcp_pool)
+            .fetch_optional(&mut *conn)
             .await?;
 
     Ok(is_servable_status(status.as_deref()))
@@ -560,6 +703,10 @@ async fn record_rebuild_failure(
     previous_servable: bool,
     error: &str,
 ) -> anyhow::Result<()> {
+    let mut conn = db_pool::acquire_runtime(mcp_pool)
+        .await
+        .context("acquire runtime database connection")?;
+
     if previous_servable {
         sqlx::query(
             r#"
@@ -571,7 +718,7 @@ async fn record_rebuild_failure(
         )
         .bind(user_id)
         .bind(error)
-        .execute(mcp_pool)
+        .execute(&mut *conn)
         .await?;
     } else {
         sqlx::query(
@@ -587,7 +734,7 @@ async fn record_rebuild_failure(
         .bind(user_id)
         .bind(IndexStatus::Failed.as_str())
         .bind(error)
-        .execute(mcp_pool)
+        .execute(&mut *conn)
         .await?;
     }
 
@@ -614,6 +761,7 @@ fn note_tag_row(parsed: &ParsedItem, fallback_updated_time: i64) -> Option<NoteT
     })
 }
 
+#[cfg(test)]
 fn prune_dangling_note_tags(rows: &mut RebuildRows) {
     let note_ids: HashSet<&str> = rows
         .notes
@@ -829,6 +977,16 @@ mod tests {
     }
 
     #[test]
+    fn full_rebuild_streams_parsed_batches_into_one_transaction() {
+        let source = include_str!("rebuild.rs");
+
+        assert!(source.contains("full_rebuild_user_in_transaction"));
+        assert!(source.contains("insert_rebuild_rows(tx, mcp_user_id, &rows).await?"));
+        assert!(source.contains("stats.add_rows(&rows)"));
+        assert!(source.contains("tx.commit()"));
+    }
+
+    #[test]
     fn malformed_note_tag_edges_are_skipped() {
         let rows = build_rebuild_rows(
             "owner",
@@ -926,6 +1084,7 @@ mod tests {
     fn outcome_reports_indexed_and_skipped_counts() {
         let mut encrypted = item("owner", "encrypted", JoplinItemType::Note, "");
         encrypted.encrypted = true;
+        encrypted.updated_time = 90;
         let rows = build_rebuild_rows(
             "owner",
             vec![
@@ -943,5 +1102,6 @@ mod tests {
 
         assert_eq!(outcome.indexed_tags, 1);
         assert_eq!(outcome.skipped_encrypted, 1);
+        assert_eq!(rows.last_seen_joplin_updated_time(), Some(90));
     }
 }

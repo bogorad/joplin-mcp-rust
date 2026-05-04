@@ -1,3 +1,4 @@
+use crate::db::pool as db_pool;
 use anyhow::{Context, bail};
 use sqlx::PgConnection;
 
@@ -10,8 +11,7 @@ pub struct SingletonLock {
 
 impl SingletonLock {
     pub async fn acquire(pool: &sqlx::PgPool) -> anyhow::Result<Self> {
-        let mut conn = pool
-            .acquire()
+        let mut conn = db_pool::acquire_runtime(pool)
             .await
             .context("acquire singleton lock database connection")?
             .detach();
