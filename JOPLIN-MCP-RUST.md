@@ -222,13 +222,13 @@ The main path is programmatic.
 10. Normal MCP calls use the MCP token.
 ```
 
-### Testing Secret Source
+### Testing Secret Sources
 
-For integration and end-to-end tests only, the harness may read real Joplin test
-credentials from repo-local SOPS data. Production code must not depend on this
-path.
+For integration and end-to-end tests only, the harness may read real Joplin and
+Postgres test credentials from repo-local SOPS data. Production code must not
+depend on this path.
 
-Required test secret keys:
+Required Joplin test secret keys:
 
 ```text
 sops -d secrets.yaml | yq '.joplin|keys'
@@ -241,8 +241,34 @@ sops -d secrets.yaml | yq '.joplin|keys'
 Test code may read `.joplin.url`, `.joplin.username`, and `.joplin.password`
 from `secrets.yaml` after decrypting with SOPS. Do not print these values. Do
 not write them into logs, snapshots, panic messages, or generated config files.
-If `secrets.yaml` is absent or the keys are missing, real-Joplin tests must skip
-unless the test target explicitly requires live credentials.
+
+Required Postgres test secret keys:
+
+```text
+sops -d secrets.yaml | yq '.postgres|keys'
+
+- host
+- port
+- database
+- joplin_user
+- joplin_password
+- mcp_user
+- mcp_password
+```
+
+Test code may assemble Postgres DSNs from those keys only after decrypting with
+SOPS. `postgres.joplin_user`/`postgres.joplin_password` are for read-only access
+to canonical Joplin tables. `postgres.mcp_user`/`postgres.mcp_password` are for
+the `joplin_mcp` schema and MCP-owned tables only. Do not reuse one role for the
+other access path.
+
+If `secrets.yaml` is absent or the keys are missing, real-Joplin/Postgres tests
+must skip unless the test target explicitly requires live credentials.
+
+Default local/unit test targets must not decrypt `secrets.yaml`. Live Joplin
+or Postgres credential use must require an explicit integration/e2e test target
+or explicit test opt-in flag. Dry-run validation may report only whether the
+required key names exist; it must not print decrypted values.
 
 ### Web Login Flow
 
@@ -454,7 +480,8 @@ shutdown_grace_seconds = 30
 base_url = "https://joplin.lan"
 
 [postgres]
-dsn_file = "/run/credentials/joplin-mcpd.service/postgres-dsn"
+joplin_dsn_file = "/run/credentials/joplin-mcpd.service/postgres-joplin-dsn"
+mcp_dsn_file = "/run/credentials/joplin-mcpd.service/postgres-mcp-dsn"
 runtime_max_connections = 12
 indexer_max_connections = 4
 acquire_timeout_seconds = 5
@@ -657,6 +684,9 @@ Create a separate schema.
 ```sql
 CREATE SCHEMA IF NOT EXISTS joplin_mcp;
 ```
+
+Create, migrate, read, and write this schema through the `mcp_user` Postgres
+connection. Do not use `joplin_user` for `joplin_mcp` tables.
 
 Do not add columns to Joplin tables. Do not add triggers to Joplin tables in v1.
 Do not add indexes to Joplin tables unless measurement proves a need.
@@ -897,6 +927,9 @@ trait JoplinSource {
 }
 ```
 
+Direct source reads must use the `joplin_user` Postgres connection. The source
+trait must not read from or write to `joplin_mcp` tables.
+
 The first implementation is `JoplinDbSource`. A future `JoplinApiSource` may use
 Joplin's delta sync API, but it is not required for v1.
 
@@ -1013,11 +1046,13 @@ Concurrency rules:
 ```text
 1. take a per-user advisory lock before refresh or rebuild
 2. skip or reschedule if another worker owns that user
-3. run background indexing through postgres.indexer_max_connections only
-4. keep foreground MCP/auth/status reads on postgres.runtime_max_connections
-5. cap rebuild work by row count, max_parallel_users, and indexer DB capacity
-6. never borrow runtime pool connections for full rebuild work
-7. update last_seen_joplin_updated_time only after all changed rows commit
+3. read canonical Joplin rows through the joplin_user connection only
+4. write derived rows through the mcp_user connection only
+5. run background indexing through postgres.indexer_max_connections only
+6. keep foreground MCP/auth/status reads on postgres.runtime_max_connections
+7. cap rebuild work by row count, max_parallel_users, and indexer DB capacity
+8. never borrow runtime pool connections for full rebuild work
+9. update last_seen_joplin_updated_time only after all changed rows commit
 ```
 
 Deleted items:
@@ -1747,8 +1782,9 @@ It must:
 ```
 
 When the end-to-end test runs against a real Joplin Server instead of the fake
-auth endpoint, it must load test-only `url`, `username`, and `password` from
-`secrets.yaml` via SOPS and must not emit those values.
+auth endpoint, it must load test-only `.joplin.url`, `.joplin.username`,
+`.joplin.password`, and the required `.postgres.*` keys from `secrets.yaml` via
+SOPS and must not emit those values.
 
 ## 21. Fail-Early Rules
 
@@ -1756,7 +1792,7 @@ The server must refuse to start if:
 
 ```text
 OTLP logging config is invalid
-Postgres DSN is missing
+one or both Postgres DSNs are missing
 Postgres connection fails
 required joplin_mcp migrations are missing
 _sqlx_migrations records a newer version than the binary supports
@@ -1843,21 +1879,32 @@ Joplin failures.
 
 ### SQL Access
 
-The MCP server Postgres role should have:
+The MCP server uses separate Postgres credentials for Joplin-owned data and
+MCP-owned data.
+
+`joplin_user` must have:
 
 ```text
-read access to required Joplin tables
-read/write access to joplin_mcp schema
+read access to required canonical Joplin tables
+no write access to Joplin tables
+no access to joplin_mcp tables unless explicitly required for inspection
 no schema ownership over Joplin tables
 no superuser
 ```
 
-Future hardening can split roles:
+`mcp_user` must have:
 
 ```text
-joplin_mcp_indexer   read Joplin tables, write joplin_mcp indexes
-joplin_mcp_runtime   read joplin_mcp indexes, read tokens
+read/write access to the joplin_mcp schema
+permission to run joplin_mcp migrations
+no access to canonical Joplin tables
+no schema ownership over Joplin tables
+no superuser
 ```
+
+Code must use the `joplin_user` connection for direct Joplin table reads and the
+`mcp_user` connection for MCP tables, tokens, audit log, derived indexes, and
+migrations. Do not collapse these into one role in v1.
 
 ### Logs
 
@@ -1925,7 +1972,8 @@ systemd.services.joplin-mcpd = {
     RuntimeDirectory = "joplin-mcp";
     UMask = "0077";
     LoadCredential = [
-      "postgres-dsn:/run/secrets/joplin-mcp/postgres-dsn"
+      "postgres-joplin-dsn:/run/secrets/joplin-mcp/postgres-joplin-dsn"
+      "postgres-mcp-dsn:/run/secrets/joplin-mcp/postgres-mcp-dsn"
       "token-hmac-key:/run/secrets/joplin-mcp/token-hmac-key"
     ];
   };
@@ -2016,7 +2064,9 @@ Deliver:
 ```text
 read real users table
 authenticate against real Joplin Server
-load real-Joplin test credentials from SOPS secrets.yaml without logging them
+load real-Joplin and Postgres test credentials from SOPS secrets.yaml without logging them
+use postgres.joplin_user for canonical Joplin table reads
+use postgres.mcp_user for joplin_mcp tables and derived index writes
 resolve real joplin_user_id from Joplin session response
 verify changed Joplin email refreshes mcp_users
 verify temporary Joplin session is invalidated after bootstrap
