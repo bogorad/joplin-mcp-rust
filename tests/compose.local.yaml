@@ -1,0 +1,27 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: local-postgres
+      POSTGRES_USER: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "127.0.0.1:55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
+  fake-joplin-auth:
+    image: ghcr.io/chuckries/rust-http-echo:latest
+    profiles: ["manual"]
+    ports:
+      - "127.0.0.1:58080:8080"
+
+  victorialogs:
+    image: victoriametrics/victoria-logs:v1.27.0-victorialogs
+    command:
+      - -storageDataPath=/victoria-logs-data
+    ports:
+      - "127.0.0.1:59428:9428"

@@ -23,6 +23,50 @@
       {
         formatter = pkgs.nixfmt;
 
+        packages = rec {
+          joplin-mcpd = pkgs.rustPlatform.buildRustPackage {
+            pname = "joplin-mcpd";
+            version = "0.1.0";
+            src = ./.;
+            cargoLock.lockFile = ./Cargo.lock;
+            buildAndTestSubdir = "crates/joplin-mcpd";
+            nativeBuildInputs = with pkgs; [ pkg-config ];
+            buildInputs = with pkgs; [ openssl ];
+          };
+
+          joplin-mcp-client = pkgs.rustPlatform.buildRustPackage {
+            pname = "joplin-mcp-client";
+            version = "0.1.0";
+            src = ./.;
+            cargoLock.lockFile = ./Cargo.lock;
+            buildAndTestSubdir = "crates/joplin-mcp-client";
+            nativeBuildInputs = with pkgs; [ pkg-config ];
+            buildInputs = with pkgs; [ openssl ];
+          };
+
+          default = joplin-mcpd;
+        };
+
+        checks = {
+          cargo-fmt =
+            pkgs.runCommand "joplin-mcp-rust-fmt"
+              {
+                nativeBuildInputs = with pkgs; [
+                  cargo
+                  rustfmt
+                ];
+              }
+              ''
+                cp -R ${./.} source
+                chmod -R u+w source
+                cd source
+                cargo fmt --check
+                touch $out
+              '';
+
+          inherit (self.packages.${system}) joplin-mcp-client joplin-mcpd;
+        };
+
         devShells.default = pkgs.mkShell {
           nativeBuildInputs = with pkgs; [
             cargo

@@ -4,3 +4,6 @@
 .beads-credential-key
 tmp/
 .tmp/
+target/
+result
+result-*
