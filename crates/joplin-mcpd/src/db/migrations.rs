@@ -79,22 +79,24 @@ mod tests {
     use super::*;
 
     const INITIAL_SQL: &str = include_str!("../../migrations/20260504000100_initial.sql");
+    const LAST_CHECKED_SQL: &str =
+        include_str!("../../migrations/20260504000101_add_last_checked_at.sql");
 
     #[test]
     fn embedded_migration_version_is_present() {
-        assert_eq!(latest_embedded_version(), 20260504000100);
+        assert_eq!(latest_embedded_version(), 20260504000101);
     }
 
     #[test]
     fn rejects_newer_applied_database_version() {
         let error =
-            ensure_applied_version_supported(Some(20260504000101), latest_embedded_version())
+            ensure_applied_version_supported(Some(20260504000102), latest_embedded_version())
                 .expect_err("newer database must be rejected");
         assert_eq!(
             error,
             MigrationVersionError::DatabaseNewerThanBinary {
-                applied_version: 20260504000101,
-                embedded_version: 20260504000100
+                applied_version: 20260504000102,
+                embedded_version: 20260504000101
             }
         );
     }
@@ -104,6 +106,8 @@ mod tests {
         ensure_applied_version_supported(None, latest_embedded_version())
             .expect("fresh database is valid");
         ensure_applied_version_supported(Some(20260504000100), latest_embedded_version())
+            .expect("current database is valid");
+        ensure_applied_version_supported(Some(20260504000101), latest_embedded_version())
             .expect("current database is valid");
     }
 
@@ -160,6 +164,12 @@ mod tests {
                 "migration must not mutate Joplin table: {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn last_checked_migration_declares_index_poll_state() {
+        assert!(LAST_CHECKED_SQL.contains("ALTER TABLE joplin_mcp.index_state"));
+        assert!(LAST_CHECKED_SQL.contains("ADD COLUMN IF NOT EXISTS last_checked_at timestamptz"));
     }
 
     #[test]

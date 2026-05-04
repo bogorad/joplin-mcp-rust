@@ -9,6 +9,7 @@ use crate::{
     config::{BootstrapRateLimitConfig, Config},
     contracts::MCP_PROTOCOL_VERSION,
     db::audit::{AuditEventType, AuditOutcome, AuditRecord, write_audit_log},
+    indexer::refresh::request_index_refresh_now,
     lifecycle::{Readiness, ReadinessStatus, RemoteIp, ShutdownDrain, extract_client_ip},
     mcp::transport::{McpAuth, mcp_delete, mcp_get, mcp_post},
     observability::{
@@ -19,7 +20,7 @@ use crate::{
 };
 use axum::{
     BoxError, Form, Json, Router,
-    body::Body,
+    body::{Body, Bytes},
     error_handling::HandleErrorLayer,
     extract::{ConnectInfo, Request as AxumRequest, State, rejection::FormRejection},
     http::{HeaderMap, StatusCode, header},
@@ -84,6 +85,10 @@ pub fn router_with_backends(
         api_backend,
         bootstrap_rate_limiter: BootstrapRateLimiter::new(),
     };
+    router_from_state(state)
+}
+
+fn router_from_state(state: AppState) -> Router {
     let request_timeout = Duration::from_secs(state.config.server.request_timeout_seconds);
     Router::new()
         .route("/healthz", get(healthz))
@@ -282,6 +287,7 @@ struct IndexStatusResponse {
     status: String,
     last_full_rebuild_at: Option<chrono::DateTime<Utc>>,
     last_incremental_at: Option<chrono::DateTime<Utc>>,
+    last_checked_at: Option<chrono::DateTime<Utc>>,
     updated_at: Option<chrono::DateTime<Utc>>,
 }
 
@@ -290,8 +296,12 @@ struct IndexStatusRow {
     status: String,
     last_full_rebuild_at: Option<chrono::DateTime<Utc>>,
     last_incremental_at: Option<chrono::DateTime<Utc>>,
+    last_checked_at: Option<chrono::DateTime<Utc>>,
     updated_at: Option<chrono::DateTime<Utc>>,
 }
+
+const BOOTSTRAP_RATE_LIMIT_MAX_IP_KEYS: usize = 4096;
+const BOOTSTRAP_RATE_LIMIT_MAX_EMAIL_KEYS: usize = 16_384;
 
 #[derive(Debug, Clone, Default)]
 struct BootstrapRateLimiter {
@@ -337,13 +347,7 @@ impl BootstrapRateLimiter {
         let email_key = email.trim().to_ascii_lowercase();
         let mut state = self.inner.lock().expect("bootstrap rate limiter lock");
 
-        if !allow_windowed_request(
-            &mut state.per_ip,
-            ip_key,
-            now,
-            Duration::from_secs(60),
-            config.per_ip_per_minute,
-        ) {
+        if !allow_ip_window(&mut state, ip_key, now, config) {
             return Err(BootstrapRateLimitRejection {
                 scope: BootstrapRateLimitScope::Ip,
             });
@@ -355,6 +359,7 @@ impl BootstrapRateLimiter {
             now,
             Duration::from_secs(60 * 60),
             config.per_email_per_hour,
+            BOOTSTRAP_RATE_LIMIT_MAX_EMAIL_KEYS,
         ) {
             return Err(BootstrapRateLimitRejection {
                 scope: BootstrapRateLimitScope::Email,
@@ -363,6 +368,49 @@ impl BootstrapRateLimiter {
 
         Ok(())
     }
+
+    fn check_ip(
+        &self,
+        remote_ip: Option<&str>,
+        config: &BootstrapRateLimitConfig,
+    ) -> Result<(), BootstrapRateLimitRejection> {
+        let now = Instant::now();
+        let ip_key = remote_ip.unwrap_or("unknown").to_string();
+        let mut state = self.inner.lock().expect("bootstrap rate limiter lock");
+
+        if allow_ip_window(&mut state, ip_key, now, config) {
+            Ok(())
+        } else {
+            Err(BootstrapRateLimitRejection {
+                scope: BootstrapRateLimitScope::Ip,
+            })
+        }
+    }
+
+    #[cfg(test)]
+    fn ip_count(&self, remote_ip: Option<&str>) -> Option<u32> {
+        let state = self.inner.lock().expect("bootstrap rate limiter lock");
+        state
+            .per_ip
+            .get(remote_ip.unwrap_or("unknown"))
+            .map(|counter| counter.count)
+    }
+}
+
+fn allow_ip_window(
+    state: &mut BootstrapRateLimitState,
+    ip_key: String,
+    now: Instant,
+    config: &BootstrapRateLimitConfig,
+) -> bool {
+    allow_windowed_request(
+        &mut state.per_ip,
+        ip_key,
+        now,
+        Duration::from_secs(60),
+        config.per_ip_per_minute,
+        BOOTSTRAP_RATE_LIMIT_MAX_IP_KEYS,
+    )
 }
 
 fn allow_windowed_request(
@@ -371,8 +419,14 @@ fn allow_windowed_request(
     now: Instant,
     window: Duration,
     limit: u32,
+    max_keys: usize,
 ) -> bool {
     if limit == 0 {
+        return false;
+    }
+
+    counters.retain(|_, counter| now.duration_since(counter.window_start) < window);
+    if !counters.contains_key(&key) && counters.len() >= max_keys {
         return false;
     }
 
@@ -394,9 +448,17 @@ fn allow_windowed_request(
 async fn bootstrap_login(
     State(state): State<AppState>,
     remote_ip: Option<axum::Extension<RemoteIp>>,
-    Json(request): Json<BootstrapLoginRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
     let remote_ip = remote_ip.map(|axum::Extension(ip)| ip.0.to_string());
+    if !has_json_content_type(&headers) {
+        return malformed_bootstrap_response(&state, remote_ip).await;
+    }
+    let request = match serde_json::from_slice::<BootstrapLoginRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => return malformed_bootstrap_response(&state, remote_ip).await,
+    };
     match mint_bootstrap_token(&state, request, remote_ip)
         .instrument(tracing::info_span!("bootstrap.login"))
         .await
@@ -415,12 +477,10 @@ async fn web_login_submit(
     remote_ip: Option<axum::Extension<RemoteIp>>,
     form: Result<Form<BootstrapLoginRequest>, FormRejection>,
 ) -> Response {
-    let Ok(Form(request)) = form else {
-        return bootstrap_error_response(BootstrapAuthError::new(
-            BootstrapAuthFailure::JoplinRejected,
-        ));
-    };
     let remote_ip = remote_ip.map(|axum::Extension(ip)| ip.0.to_string());
+    let Ok(Form(request)) = form else {
+        return malformed_bootstrap_response(&state, remote_ip).await;
+    };
     match mint_bootstrap_token(&state, request, remote_ip)
         .instrument(tracing::info_span!("bootstrap.login"))
         .await
@@ -428,6 +488,42 @@ async fn web_login_submit(
         Ok(response) => Html(render_login_success(&response.token)).into_response(),
         Err(response) => response,
     }
+}
+
+fn has_json_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            let media_type = value
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            media_type == "application/json" || media_type.ends_with("+json")
+        })
+        .unwrap_or(false)
+}
+
+async fn malformed_bootstrap_response(state: &AppState, remote_ip: Option<String>) -> Response {
+    if let Err(rejection) = state
+        .bootstrap_rate_limiter
+        .check_ip(remote_ip.as_deref(), &state.config.bootstrap_rate_limit)
+    {
+        metrics::record_bootstrap_login("rate_limited");
+        if let ApiBackend::Repository { mcp_pool, .. } = &state.api_backend {
+            audit_bootstrap_rate_limit(mcp_pool, "joplin-mcp-client", remote_ip.clone(), rejection)
+                .await;
+        }
+        return bootstrap_error_response(BootstrapAuthError::new(
+            BootstrapAuthFailure::RateLimited,
+        ));
+    }
+
+    bootstrap_error_response(BootstrapAuthError::new(
+        BootstrapAuthFailure::JoplinRejected,
+    ))
 }
 
 async fn mint_bootstrap_token(
@@ -568,6 +664,18 @@ async fn mint_bootstrap_token(
             return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
         }
     };
+
+    if let Err(error) = request_index_refresh_now(mcp_pool, mcp_user.id)
+        .instrument(tracing::info_span!("bootstrap.index_wake_up"))
+        .await
+    {
+        tracing::warn!(
+            operation = "bootstrap_login",
+            user_id = %mcp_user.id,
+            %error,
+            "failed to request immediate index refresh after bootstrap"
+        );
+    }
 
     audit_or_warn(
         mcp_pool,
@@ -749,7 +857,7 @@ async fn index_status(State(state): State<AppState>, headers: HeaderMap) -> Resp
     };
     let row = match sqlx::query_as::<_, IndexStatusRow>(
         r#"
-        SELECT status, last_full_rebuild_at, last_incremental_at, updated_at
+        SELECT status, last_full_rebuild_at, last_incremental_at, last_checked_at, updated_at
         FROM joplin_mcp.index_state
         WHERE user_id = $1
         "#,
@@ -775,12 +883,14 @@ async fn index_status(State(state): State<AppState>, headers: HeaderMap) -> Resp
             status: "missing".to_string(),
             last_full_rebuild_at: None,
             last_incremental_at: None,
+            last_checked_at: None,
             updated_at: None,
         },
         |row| IndexStatusResponse {
             status: row.status,
             last_full_rebuild_at: row.last_full_rebuild_at,
             last_incremental_at: row.last_incremental_at,
+            last_checked_at: row.last_checked_at,
             updated_at: row.updated_at,
         },
     );
@@ -1036,6 +1146,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_form_bootstrap_attempts_are_rate_limited_by_ip() {
+        let state = test_state(bootstrap_rate_limit_config(1, 10));
+        let app = router_from_state(state.clone());
+
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/login")
+                        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                        .body(Body::from("email=user%40example.test"))
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+
+            assert_uniform_bootstrap_error(response).await;
+        }
+
+        assert_eq!(
+            state.bootstrap_rate_limiter.ip_count(Some("127.0.0.1")),
+            Some(1)
+        );
+        let rejection = state
+            .bootstrap_rate_limiter
+            .check_ip(Some("127.0.0.1"), &state.config.bootstrap_rate_limit)
+            .expect_err("same IP remains rate limited after malformed form attempts");
+        assert_eq!(rejection.scope, BootstrapRateLimitScope::Ip);
+        assert!(
+            state
+                .bootstrap_rate_limiter
+                .check_ip(Some("127.0.0.2"), &state.config.bootstrap_rate_limit)
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_json_bootstrap_attempts_are_rate_limited_by_ip() {
+        let state = test_state(bootstrap_rate_limit_config(1, 10));
+        let app = router_from_state(state.clone());
+
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/api/bootstrap/login")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::ORIGIN, "http://127.0.0.1:8081")
+                        .body(Body::from("{"))
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+
+            assert_uniform_bootstrap_error(response).await;
+        }
+
+        assert_eq!(
+            state.bootstrap_rate_limiter.ip_count(Some("127.0.0.1")),
+            Some(1)
+        );
+        let rejection = state
+            .bootstrap_rate_limiter
+            .check_ip(Some("127.0.0.1"), &state.config.bootstrap_rate_limit)
+            .expect_err("same IP remains rate limited after malformed JSON attempts");
+        assert_eq!(rejection.scope, BootstrapRateLimitScope::Ip);
+        assert!(
+            state
+                .bootstrap_rate_limiter
+                .check_ip(Some("127.0.0.2"), &state.config.bootstrap_rate_limit)
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
     async fn login_post_rejects_disallowed_origin_and_referer() {
         let app = router(Config::default(), Readiness::new(ReadinessStatus::Ready));
 
@@ -1164,6 +1349,23 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_login_requests_index_wake_up_after_token_mint() {
+        let source = include_str!("http.rs");
+        let token_mint = source
+            .find("tracing::info_span!(\"bootstrap.token_mint\")")
+            .expect("token mint span exists");
+        let wake_up = source
+            .find("request_index_refresh_now(mcp_pool, mcp_user.id)")
+            .expect("index wake-up request exists");
+        let success_metric = source
+            .find("metrics::record_bootstrap_login(\"success\")")
+            .expect("success metric exists");
+
+        assert!(token_mint < wake_up);
+        assert!(wake_up < success_metric);
+    }
+
+    #[test]
     fn bootstrap_rate_limiter_rejects_per_ip_before_window_reset() {
         let limiter = BootstrapRateLimiter::new();
         let config = BootstrapRateLimitConfig {
@@ -1225,17 +1427,118 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bootstrap_rate_limiter_prunes_expired_ip_and_email_keys() {
+        let limiter = BootstrapRateLimiter::new();
+        let config = BootstrapRateLimitConfig {
+            per_ip_per_minute: 10,
+            per_email_per_hour: 10,
+        };
+        let stale_start = Instant::now() - Duration::from_secs(2 * 60 * 60);
+        {
+            let mut state = limiter.inner.lock().expect("limiter state");
+            state.per_ip.insert(
+                "192.0.2.100".to_string(),
+                WindowCounter {
+                    window_start: stale_start,
+                    count: 1,
+                },
+            );
+            state.per_email.insert(
+                "stale@example.test".to_string(),
+                WindowCounter {
+                    window_start: stale_start,
+                    count: 1,
+                },
+            );
+        }
+
+        assert!(
+            limiter
+                .check(Some("192.0.2.101"), "fresh@example.test", &config)
+                .is_ok()
+        );
+
+        let state = limiter.inner.lock().expect("limiter state");
+        assert!(!state.per_ip.contains_key("192.0.2.100"));
+        assert!(!state.per_email.contains_key("stale@example.test"));
+        assert!(state.per_ip.contains_key("192.0.2.101"));
+        assert!(state.per_email.contains_key("fresh@example.test"));
+    }
+
+    #[test]
+    fn bootstrap_rate_limiter_rejects_new_keys_when_active_window_is_full() {
+        let now = Instant::now();
+        let mut counters = BTreeMap::new();
+        counters.insert(
+            "one".to_string(),
+            WindowCounter {
+                window_start: now,
+                count: 1,
+            },
+        );
+        counters.insert(
+            "two".to_string(),
+            WindowCounter {
+                window_start: now,
+                count: 1,
+            },
+        );
+
+        assert!(!allow_windowed_request(
+            &mut counters,
+            "three".to_string(),
+            now,
+            Duration::from_secs(60),
+            10,
+            2,
+        ));
+        assert_eq!(counters.len(), 2);
+        assert!(allow_windowed_request(
+            &mut counters,
+            "one".to_string(),
+            now,
+            Duration::from_secs(60),
+            10,
+            2,
+        ));
+    }
+
     #[tokio::test]
     async fn bootstrap_rate_limited_error_is_uniform() {
         let response =
             bootstrap_error_response(BootstrapAuthError::new(BootstrapAuthFailure::RateLimited));
 
+        assert_uniform_bootstrap_error(response).await;
+    }
+
+    async fn assert_uniform_bootstrap_error(response: Response) {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         let body = to_bytes(response.into_body(), 1024).await.expect("body");
         assert_eq!(
             body.as_ref(),
             crate::auth::joplin::BOOTSTRAP_AUTH_FAILED_MESSAGE.as_bytes()
         );
+    }
+
+    fn bootstrap_rate_limit_config(per_ip_per_minute: u32, per_email_per_hour: u32) -> Config {
+        Config {
+            bootstrap_rate_limit: BootstrapRateLimitConfig {
+                per_ip_per_minute,
+                per_email_per_hour,
+            },
+            ..Config::default()
+        }
+    }
+
+    fn test_state(config: Config) -> AppState {
+        AppState {
+            config,
+            readiness: Readiness::new(ReadinessStatus::Ready),
+            mcp_auth: McpAuth::SyntaxOnly,
+            api_backend: ApiBackend::NotConfigured,
+            bootstrap_rate_limiter: BootstrapRateLimiter::new(),
+        }
     }
 
     fn bearer() -> String {

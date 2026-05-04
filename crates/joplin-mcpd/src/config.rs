@@ -289,7 +289,6 @@ impl Default for McpConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct IndexConfig {
-    pub source: String,
     pub refresh_interval_seconds: u64,
     pub full_rebuild_interval_hours: u64,
     pub max_parallel_users: u32,
@@ -300,7 +299,6 @@ pub struct IndexConfig {
 impl Default for IndexConfig {
     fn default() -> Self {
         Self {
-            source: "joplin_db".to_string(),
             refresh_interval_seconds: 60,
             full_rebuild_interval_hours: 24,
             max_parallel_users: 4,
@@ -455,6 +453,41 @@ statement_timeout_seconds = 15
         );
 
         let error = Config::load(Some(&config_path)).expect_err("unknown password rejected");
+        assert!(format!("{error:?}").contains("unknown field"));
+    }
+
+    #[test]
+    fn rejects_removed_index_source_config_field() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let joplin_dsn_file = dir.path().join("postgres-joplin-dsn");
+        let mcp_dsn_file = dir.path().join("postgres-mcp-dsn");
+        write_file(
+            &joplin_dsn_file,
+            "postgres://joplin_user@127.0.0.1/joplin_db",
+        );
+        write_file(&mcp_dsn_file, "postgres://mcp_user@127.0.0.1/mcp_db");
+        write_file(
+            &config_path,
+            &format!(
+                r#"
+[postgres]
+joplin_dsn_file = "{}"
+mcp_dsn_file = "{}"
+runtime_max_connections = 12
+indexer_max_connections = 4
+acquire_timeout_seconds = 5
+statement_timeout_seconds = 15
+
+[index]
+source = "joplin_db"
+"#,
+                joplin_dsn_file.display(),
+                mcp_dsn_file.display()
+            ),
+        );
+
+        let error = Config::load(Some(&config_path)).expect_err("unknown source rejected");
         assert!(format!("{error:?}").contains("unknown field"));
     }
 

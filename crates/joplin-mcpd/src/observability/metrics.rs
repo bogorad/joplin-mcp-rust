@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 pub const INDEX_LAG_SECONDS: &str = "index_lag_seconds";
 pub const INDEX_REFRESH_DURATION_SECONDS: &str = "index_refresh_duration_seconds";
+pub const INDEX_WORKER_CYCLE_USERS_TOTAL: &str = "index_worker_cycle_users_total";
 pub const MCP_TOOL_DURATION_SECONDS: &str = "mcp_tool_duration_seconds";
 pub const MCP_TOOL_ERRORS_TOTAL: &str = "mcp_tool_errors_total";
 pub const BOOTSTRAP_LOGIN_TOTAL: &str = "bootstrap_login_total";
@@ -14,12 +15,20 @@ pub const POSTGRES_POOL_WAIT_SECONDS: &str = "postgres_pool_wait_seconds";
 
 pub const LABEL_USER_HASH: &str = "user.hash";
 pub const LABEL_OUTCOME: &str = "outcome";
+pub const LABEL_KIND: &str = "kind";
 pub const LABEL_TOOL: &str = "tool";
 pub const LABEL_ERROR_KIND: &str = "error.kind";
 pub const LABEL_POOL: &str = "pool";
 
 pub const BOOTSTRAP_OUTCOMES: &[&str] = &["success", "failed", "rate_limited"];
 pub const INDEX_REFRESH_OUTCOMES: &[&str] = &["success", "failed", "skipped_lock", "full_rebuild"];
+pub const INDEX_WORKER_CYCLE_KINDS: &[&str] = &[
+    "checked",
+    "refreshed",
+    "skipped_current",
+    "skipped_lock",
+    "failed",
+];
 pub const POSTGRES_POOLS: &[&str] = &["runtime", "indexer"];
 pub const ALERT_INDEX_STATUS_FAILED: &str = "index_status_failed";
 pub const ALERT_BOOTSTRAP_ERRORS_ABOVE_THRESHOLD: &str = "bootstrap_errors_above_threshold";
@@ -74,6 +83,13 @@ static INDEX_REFRESH_DURATION: Lazy<Histogram<f64>> = Lazy::new(|| {
         .build()
 });
 
+static INDEX_WORKER_CYCLE_USERS: Lazy<Counter<u64>> = Lazy::new(|| {
+    global::meter("joplin-mcpd")
+        .u64_counter(INDEX_WORKER_CYCLE_USERS_TOTAL)
+        .with_description("Index worker cycle user totals by bounded aggregate kind.")
+        .build()
+});
+
 static MCP_TOOL_DURATION: Lazy<Histogram<f64>> = Lazy::new(|| {
     global::meter("joplin-mcpd")
         .f64_histogram(MCP_TOOL_DURATION_SECONDS)
@@ -117,6 +133,20 @@ pub fn record_index_refresh_duration(outcome: &str, duration: Duration) {
         &[KeyValue::new(
             LABEL_OUTCOME,
             bounded(outcome, INDEX_REFRESH_OUTCOMES, "failed"),
+        )],
+    );
+}
+
+pub fn record_index_worker_cycle_users(kind: &str, count: u64) {
+    if count == 0 {
+        return;
+    }
+
+    INDEX_WORKER_CYCLE_USERS.add(
+        count,
+        &[KeyValue::new(
+            LABEL_KIND,
+            bounded(kind, INDEX_WORKER_CYCLE_KINDS, "failed"),
         )],
     );
 }
@@ -194,6 +224,10 @@ mod tests {
             INDEX_REFRESH_DURATION_SECONDS,
             "index_refresh_duration_seconds"
         );
+        assert_eq!(
+            INDEX_WORKER_CYCLE_USERS_TOTAL,
+            "index_worker_cycle_users_total"
+        );
         assert_eq!(MCP_TOOL_DURATION_SECONDS, "mcp_tool_duration_seconds");
         assert_eq!(MCP_TOOL_ERRORS_TOTAL, "mcp_tool_errors_total");
         assert_eq!(BOOTSTRAP_LOGIN_TOTAL, "bootstrap_login_total");
@@ -219,6 +253,14 @@ mod tests {
         assert_eq!(bounded_tool("search_notes"), "search_notes");
         assert_eq!(bounded_tool("made_up_tool"), "unknown");
         assert_eq!(bounded("panic", MCP_ERROR_KINDS, "internal"), "internal");
+        assert_eq!(
+            bounded("skipped_current", INDEX_WORKER_CYCLE_KINDS, "failed"),
+            "skipped_current"
+        );
+        assert_eq!(
+            bounded("raw-user-id", INDEX_WORKER_CYCLE_KINDS, "failed"),
+            "failed"
+        );
         assert_eq!(bounded("indexer", POSTGRES_POOLS, "runtime"), "indexer");
     }
 

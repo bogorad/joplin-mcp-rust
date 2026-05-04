@@ -1,4 +1,7 @@
-use crate::contracts::{ErrorCode, READ_ONLY_MODE, UNSUPPORTED_SHARED_NOTEBOOKS};
+use crate::{
+    contracts::{ErrorCode, READ_ONLY_MODE, UNSUPPORTED_SHARED_NOTEBOOKS},
+    indexer::refresh::request_index_refresh_now,
+};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
@@ -115,6 +118,7 @@ pub enum IndexStatus {
     Stale,
     Rebuilding,
     Error,
+    Empty,
     Missing,
 }
 
@@ -123,8 +127,9 @@ impl IndexStatus {
         match value {
             "ready" => Ok(Self::Ready),
             "stale" => Ok(Self::Stale),
-            "rebuilding" => Ok(Self::Rebuilding),
-            "error" => Ok(Self::Error),
+            "building" | "rebuilding" => Ok(Self::Rebuilding),
+            "failed" | "error" => Ok(Self::Error),
+            "empty" => Ok(Self::Empty),
             _ => Err(ToolError::validation(format!(
                 "unknown index status {value}"
             ))),
@@ -137,6 +142,7 @@ pub struct IndexStateSnapshot {
     pub status: IndexStatus,
     pub last_full_rebuild_at: Option<DateTime<Utc>>,
     pub last_incremental_at: Option<DateTime<Utc>>,
+    pub last_checked_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
 }
 
@@ -145,6 +151,8 @@ pub struct IndexMetadata {
     pub index_status: IndexStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_indexed_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_checked_at: Option<DateTime<Utc>>,
 }
 
 pub fn gate_index_state(snapshot: Option<&IndexStateSnapshot>) -> Result<IndexMetadata, ToolError> {
@@ -159,8 +167,30 @@ pub fn gate_index_state(snapshot: Option<&IndexStateSnapshot>) -> Result<IndexMe
                 .last_incremental_at
                 .or(snapshot.last_full_rebuild_at)
                 .or(snapshot.updated_at),
+            last_checked_at: snapshot.last_checked_at,
         }),
         status => Err(ToolError::index_not_ready(status)),
+    }
+}
+
+fn tool_gate_should_request_index_wake_up(
+    snapshot: Option<&IndexStateSnapshot>,
+    now: DateTime<Utc>,
+) -> bool {
+    let Some(snapshot) = snapshot else {
+        return true;
+    };
+
+    match snapshot.status {
+        IndexStatus::Error | IndexStatus::Empty => true,
+        IndexStatus::Stale => snapshot
+            .last_checked_at
+            .map(|checked_at| {
+                now.signed_duration_since(checked_at).num_seconds()
+                    >= DEFAULT_RETRY_AFTER_SECONDS as i64
+            })
+            .unwrap_or(true),
+        IndexStatus::Ready | IndexStatus::Rebuilding | IndexStatus::Missing => false,
     }
 }
 
@@ -638,6 +668,7 @@ pub fn status_response(user: &str, index: IndexMetadata) -> Value {
         "mode": READ_ONLY_MODE,
         "index_status": index.index_status,
         "last_indexed_at": index.last_indexed_at,
+        "last_checked_at": index.last_checked_at,
         "unencrypted_only": true,
         "shared_notebooks": UNSUPPORTED_SHARED_NOTEBOOKS
     })
@@ -651,6 +682,7 @@ pub async fn status_tool(pool: &PgPool, scope: &UserScope) -> Result<Value, Tool
             state.status,
             state.last_full_rebuild_at,
             state.last_incremental_at,
+            state.last_checked_at,
             state.updated_at
         FROM joplin_mcp.mcp_users users
         LEFT JOIN joplin_mcp.index_state state ON state.user_id = users.id
@@ -1125,7 +1157,7 @@ async fn ready_index_metadata(
 ) -> Result<IndexMetadata, ToolError> {
     let snapshot = sqlx::query_as::<_, IndexStateRow>(
         r#"
-        SELECT status, last_full_rebuild_at, last_incremental_at, updated_at
+        SELECT status, last_full_rebuild_at, last_incremental_at, last_checked_at, updated_at
         FROM joplin_mcp.index_state
         WHERE user_id = $1
         "#,
@@ -1136,6 +1168,12 @@ async fn ready_index_metadata(
     .map_err(|error| ToolError::internal("failed to read index state", error))?
     .map(IndexStateRow::snapshot)
     .transpose()?;
+
+    if tool_gate_should_request_index_wake_up(snapshot.as_ref(), Utc::now()) {
+        request_index_refresh_now(pool, scope.user_id())
+            .await
+            .map_err(|error| ToolError::internal("failed to request index refresh", error))?;
+    }
 
     gate_index_state(snapshot.as_ref())
 }
@@ -1775,6 +1813,7 @@ struct StatusRow {
     status: Option<String>,
     last_full_rebuild_at: Option<DateTime<Utc>>,
     last_incremental_at: Option<DateTime<Utc>>,
+    last_checked_at: Option<DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
 }
 
@@ -1784,12 +1823,14 @@ impl StatusRow {
             return Ok(IndexMetadata {
                 index_status: IndexStatus::Missing,
                 last_indexed_at: None,
+                last_checked_at: None,
             });
         };
         let snapshot = IndexStateSnapshot {
             status: IndexStatus::from_db(status)?,
             last_full_rebuild_at: self.last_full_rebuild_at,
             last_incremental_at: self.last_incremental_at,
+            last_checked_at: self.last_checked_at,
             updated_at: self.updated_at,
         };
         Ok(IndexMetadata {
@@ -1798,6 +1839,7 @@ impl StatusRow {
                 .last_incremental_at
                 .or(snapshot.last_full_rebuild_at)
                 .or(snapshot.updated_at),
+            last_checked_at: snapshot.last_checked_at,
         })
     }
 }
@@ -1807,6 +1849,7 @@ struct IndexStateRow {
     status: String,
     last_full_rebuild_at: Option<DateTime<Utc>>,
     last_incremental_at: Option<DateTime<Utc>>,
+    last_checked_at: Option<DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
 }
 
@@ -1816,6 +1859,7 @@ impl IndexStateRow {
             status: IndexStatus::from_db(&self.status)?,
             last_full_rebuild_at: self.last_full_rebuild_at,
             last_incremental_at: self.last_incremental_at,
+            last_checked_at: self.last_checked_at,
             updated_at: self.updated_at,
         })
     }
@@ -2233,6 +2277,7 @@ mod tests {
             status: IndexStatus::Rebuilding,
             last_full_rebuild_at: None,
             last_incremental_at: None,
+            last_checked_at: None,
             updated_at: None,
         };
         assert_eq!(
@@ -2247,11 +2292,59 @@ mod tests {
             status: IndexStatus::Stale,
             last_full_rebuild_at: None,
             last_incremental_at: Some(indexed_at),
+            last_checked_at: Some(indexed_at),
             updated_at: None,
         };
         let metadata = gate_index_state(Some(&stale)).expect("stale is servable");
         assert_eq!(metadata.index_status, IndexStatus::Stale);
         assert_eq!(metadata.last_indexed_at, Some(indexed_at));
+        assert_eq!(metadata.last_checked_at, Some(indexed_at));
+    }
+
+    #[test]
+    fn index_gate_wake_up_covers_missing_failed_and_old_stale_state() {
+        let now = Utc::now();
+        assert!(tool_gate_should_request_index_wake_up(None, now));
+
+        let failed = IndexStateSnapshot {
+            status: IndexStatus::Error,
+            last_full_rebuild_at: None,
+            last_incremental_at: None,
+            last_checked_at: Some(now),
+            updated_at: Some(now),
+        };
+        assert!(tool_gate_should_request_index_wake_up(Some(&failed), now));
+
+        let old_stale = IndexStateSnapshot {
+            status: IndexStatus::Stale,
+            last_full_rebuild_at: None,
+            last_incremental_at: Some(now),
+            last_checked_at: Some(now - chrono::Duration::seconds(6)),
+            updated_at: Some(now),
+        };
+        assert!(tool_gate_should_request_index_wake_up(
+            Some(&old_stale),
+            now
+        ));
+
+        let fresh_stale = IndexStateSnapshot {
+            last_checked_at: Some(now),
+            ..old_stale
+        };
+        assert!(!tool_gate_should_request_index_wake_up(
+            Some(&fresh_stale),
+            now
+        ));
+    }
+
+    #[test]
+    fn index_status_maps_db_failure_states_for_tool_gate() {
+        assert_eq!(
+            IndexStatus::from_db("building").unwrap(),
+            IndexStatus::Rebuilding
+        );
+        assert_eq!(IndexStatus::from_db("failed").unwrap(), IndexStatus::Error);
+        assert_eq!(IndexStatus::from_db("empty").unwrap(), IndexStatus::Empty);
     }
 
     #[test]
@@ -2323,6 +2416,7 @@ mod tests {
             IndexMetadata {
                 index_status: IndexStatus::Ready,
                 last_indexed_at: None,
+                last_checked_at: None,
             },
         );
         assert_eq!(value["mode"], "read-only");
@@ -2471,6 +2565,7 @@ mod tests {
             status: None,
             last_full_rebuild_at: None,
             last_incremental_at: None,
+            last_checked_at: None,
             updated_at: None,
         };
         let metadata = row.index_metadata().expect("metadata");

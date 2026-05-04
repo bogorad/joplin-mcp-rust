@@ -1,7 +1,7 @@
 use crate::indexer::JoplinItemType;
 use crate::indexer::item_content::parse_index_item;
 use crate::indexer::parser::{ParsedItem, extract_resource_refs};
-use crate::indexer::source::{JoplinItem, JoplinSource};
+use crate::indexer::source::{JOPLIN_ITEM_BATCH_SIZE, JoplinItem, JoplinItemCursor, JoplinSource};
 use anyhow::Context;
 use sqlx::{PgPool, Postgres, QueryBuilder};
 use std::collections::HashSet;
@@ -154,11 +154,27 @@ where
         .context("check previous index state")?;
 
     let result: anyhow::Result<FullRebuildOutcome> = async {
-        let items = source
-            .changed_items_since(joplin_user_id, None)
-            .await
-            .context("load all Joplin items for full rebuild")?;
-        let rows = build_rebuild_rows(joplin_user_id, items);
+        let mut rows = RebuildRows::default();
+        let mut after = None;
+
+        loop {
+            let items = source
+                .changed_items_batch(joplin_user_id, None, after.as_ref(), JOPLIN_ITEM_BATCH_SIZE)
+                .await
+                .context("load Joplin item batch for full rebuild")?;
+            if items.is_empty() {
+                break;
+            }
+
+            let batch_len = items.len();
+            after = items.last().map(JoplinItemCursor::from);
+            append_rebuild_rows(&mut rows, joplin_user_id, items);
+            if batch_len < JOPLIN_ITEM_BATCH_SIZE as usize {
+                break;
+            }
+        }
+
+        prune_dangling_note_tags(&mut rows);
         replace_derived_rows(mcp_pool, mcp_user_id, &rows).await?;
         Ok(rows.outcome())
     }
@@ -175,9 +191,15 @@ where
     }
 }
 
+#[cfg(test)]
 fn build_rebuild_rows(joplin_user_id: &str, items: Vec<JoplinItem>) -> RebuildRows {
     let mut rows = RebuildRows::default();
+    append_rebuild_rows(&mut rows, joplin_user_id, items);
+    prune_dangling_note_tags(&mut rows);
+    rows
+}
 
+fn append_rebuild_rows(rows: &mut RebuildRows, joplin_user_id: &str, items: Vec<JoplinItem>) {
     for item in items {
         if item.owner_id != joplin_user_id {
             rows.skipped_wrong_owner += 1;
@@ -262,9 +284,6 @@ fn build_rebuild_rows(joplin_user_id: &str, items: Vec<JoplinItem>) -> RebuildRo
             }
         }
     }
-
-    prune_dangling_note_tags(&mut rows);
-    rows
 }
 
 async fn replace_derived_rows(
@@ -313,6 +332,7 @@ async fn replace_derived_rows(
         SET status = $2,
             last_full_rebuild_at = now(),
             last_incremental_at = now(),
+            last_checked_at = now(),
             last_seen_joplin_updated_time = $3,
             last_error = NULL,
             updated_at = now()
@@ -799,6 +819,13 @@ mod tests {
     #[test]
     fn insert_batch_size_stays_bounded_for_live_note_bodies() {
         assert_eq!(INSERT_BATCH_ROWS, 100);
+    }
+
+    #[test]
+    fn source_fetch_batch_size_stays_bounded_for_live_note_bodies() {
+        assert_eq!(JOPLIN_ITEM_BATCH_SIZE, 500);
+        let source = include_str!("rebuild.rs");
+        assert!(source.contains("changed_items_batch"));
     }
 
     #[test]

@@ -3,6 +3,7 @@ pub mod parser;
 pub mod rebuild;
 pub mod refresh;
 pub mod source;
+pub mod worker;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoplinItemType {

@@ -2,22 +2,34 @@ use crate::config::IndexConfig;
 use crate::indexer::JoplinItemType;
 use crate::indexer::item_content::parse_index_item;
 use crate::indexer::parser::{ParsedItem, extract_resource_refs};
-use crate::indexer::rebuild::{IndexStatus, full_rebuild_user};
-use crate::indexer::source::{JoplinItem, JoplinSource};
+use crate::indexer::rebuild::{FullRebuildOutcome, IndexStatus, full_rebuild_user};
+use crate::indexer::source::{JOPLIN_ITEM_BATCH_SIZE, JoplinItem, JoplinItemCursor, JoplinSource};
 use crate::observability::metrics;
 use anyhow::Context;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use std::collections::HashSet;
 use std::time::Instant;
 use tracing::Instrument;
 use uuid::Uuid;
 
+const REQUEST_INDEX_REFRESH_NOW_SQL: &str = r#"
+INSERT INTO joplin_mcp.index_state (user_id, status, last_checked_at, updated_at)
+VALUES ($1, $2, NULL, now())
+ON CONFLICT (user_id) DO UPDATE
+SET last_checked_at = NULL,
+    updated_at = now()
+WHERE joplin_mcp.index_state.status <> $3
+"#;
+
 #[derive(Debug, Clone, FromRow, PartialEq, Eq)]
 pub struct RefreshUser {
     pub mcp_user_id: Uuid,
     pub joplin_user_id: String,
+    pub status: Option<String>,
     pub last_incremental_at: Option<DateTime<Utc>>,
+    pub last_full_rebuild_at: Option<DateTime<Utc>>,
+    pub last_checked_at: Option<DateTime<Utc>>,
     pub last_seen_joplin_updated_time: Option<i64>,
 }
 
@@ -27,6 +39,8 @@ pub struct IncrementalRefreshOutcome {
     pub full_rebuild_required: bool,
     pub changed_items: usize,
     pub reconciled_deleted_items: usize,
+    pub full_rebuild_indexed_items: usize,
+    pub full_rebuild_deleted_items: usize,
     pub skipped_encrypted: usize,
     pub skipped_malformed: usize,
     pub skipped_wrong_owner: usize,
@@ -39,9 +53,29 @@ impl IncrementalRefreshOutcome {
             full_rebuild_required: false,
             changed_items: 0,
             reconciled_deleted_items: 0,
+            full_rebuild_indexed_items: 0,
+            full_rebuild_deleted_items: 0,
             skipped_encrypted: 0,
             skipped_malformed: 0,
             skipped_wrong_owner: 0,
+        }
+    }
+
+    fn from_full_rebuild(rebuild: FullRebuildOutcome) -> Self {
+        Self {
+            lock_acquired: true,
+            full_rebuild_required: true,
+            changed_items: 0,
+            reconciled_deleted_items: 0,
+            full_rebuild_indexed_items: rebuild.indexed_notes
+                + rebuild.indexed_notebooks
+                + rebuild.indexed_tags
+                + rebuild.indexed_note_tags
+                + rebuild.indexed_resources,
+            full_rebuild_deleted_items: rebuild.indexed_deleted_items,
+            skipped_encrypted: rebuild.skipped_encrypted,
+            skipped_malformed: rebuild.skipped_malformed,
+            skipped_wrong_owner: rebuild.skipped_wrong_owner,
         }
     }
 }
@@ -53,6 +87,26 @@ struct IncrementalRows {
     skipped_encrypted: usize,
     skipped_malformed: usize,
     skipped_wrong_owner: usize,
+}
+
+#[derive(Debug, Default)]
+struct IncrementalTotals {
+    changed_items: usize,
+    reconciled_deleted_items: usize,
+    skipped_encrypted: usize,
+    skipped_malformed: usize,
+    skipped_wrong_owner: usize,
+    last_seen_joplin_updated_time: Option<i64>,
+}
+
+impl IncrementalTotals {
+    fn add_rows(&mut self, rows: &IncrementalRows, previous: Option<i64>) {
+        self.skipped_encrypted += rows.skipped_encrypted;
+        self.skipped_malformed += rows.skipped_malformed;
+        self.skipped_wrong_owner += rows.skipped_wrong_owner;
+        self.last_seen_joplin_updated_time =
+            rows.last_seen_joplin_updated_time(self.last_seen_joplin_updated_time.or(previous));
+    }
 }
 
 impl IncrementalRows {
@@ -111,7 +165,10 @@ pub async fn due_refresh_users(
         SELECT
             users.id AS mcp_user_id,
             users.joplin_user_id,
+            state.status,
             state.last_incremental_at,
+            state.last_full_rebuild_at,
+            state.last_checked_at,
             state.last_seen_joplin_updated_time
         FROM joplin_mcp.mcp_users users
         JOIN joplin_mcp.mcp_tokens tokens ON tokens.user_id = users.id
@@ -120,19 +177,64 @@ pub async fn due_refresh_users(
           AND tokens.revoked_at IS NULL
           AND (tokens.expires_at IS NULL OR tokens.expires_at > now())
           AND (
-            state.last_incremental_at IS NULL
-            OR state.last_incremental_at <= now() - ($1::bigint * interval '1 second')
+            state.user_id IS NULL
+            OR state.status IN ('failed', 'empty', 'building')
+            OR state.last_checked_at IS NULL
+            OR state.last_checked_at <= now() - ($1::bigint * interval '1 second')
+            OR state.last_full_rebuild_at IS NULL
+            OR state.last_full_rebuild_at <= now() - ($3::bigint * interval '1 hour')
           )
-        GROUP BY users.id, users.joplin_user_id, state.last_incremental_at, state.last_seen_joplin_updated_time
-        ORDER BY state.last_incremental_at ASC NULLS FIRST, users.id ASC
+        GROUP BY users.id, users.joplin_user_id, state.status, state.last_incremental_at, state.last_full_rebuild_at, state.last_checked_at, state.last_seen_joplin_updated_time
+        ORDER BY state.last_checked_at ASC NULLS FIRST, users.id ASC
         LIMIT $2
         "#,
     )
     .bind(config.refresh_interval_seconds as i64)
     .bind(limit)
+    .bind(config.full_rebuild_interval_hours as i64)
     .fetch_all(mcp_pool)
     .await
-    .context("load due refresh users")
+        .context("load due refresh users")
+}
+
+pub async fn request_index_refresh_now(mcp_pool: &PgPool, user_id: Uuid) -> anyhow::Result<()> {
+    sqlx::query(REQUEST_INDEX_REFRESH_NOW_SQL)
+        .bind(user_id)
+        .bind(IndexStatus::Empty.as_str())
+        .bind(IndexStatus::Building.as_str())
+        .execute(mcp_pool)
+        .await
+        .context("request index refresh now")?;
+
+    Ok(())
+}
+
+pub fn refresh_needed(
+    user: &RefreshUser,
+    source_watermark: Option<i64>,
+    config: &IndexConfig,
+) -> bool {
+    match user.status.as_deref() {
+        Some("ready" | "stale") => {}
+        _ => return true,
+    }
+
+    if requires_full_rebuild(
+        refresh_gap_seconds(user.last_incremental_at),
+        config.incremental_lookback_max_seconds,
+    ) || full_rebuild_due(
+        user.last_full_rebuild_at,
+        config.full_rebuild_interval_hours,
+    ) {
+        return true;
+    }
+
+    match (source_watermark, user.last_seen_joplin_updated_time) {
+        (Some(source_watermark), Some(last_seen)) => source_watermark > last_seen,
+        (Some(_), None) => true,
+        (None, None) => false,
+        (None, Some(_)) => false,
+    }
 }
 
 pub async fn incremental_refresh_user<S>(
@@ -167,31 +269,33 @@ where
     }
 
     let gap_seconds = refresh_gap_seconds(user.last_incremental_at);
-    if requires_full_rebuild(gap_seconds, config.incremental_lookback_max_seconds) {
-        if let Err(error) =
-            full_rebuild_user(mcp_pool, source, user.mcp_user_id, &user.joplin_user_id)
+    if requires_full_rebuild(gap_seconds, config.incremental_lookback_max_seconds)
+        || full_rebuild_due(
+            user.last_full_rebuild_at,
+            config.full_rebuild_interval_hours,
+        )
+    {
+        let rebuild_outcome =
+            match full_rebuild_user(mcp_pool, source, user.mcp_user_id, &user.joplin_user_id)
                 .instrument(tracing::info_span!("index.full_rebuild"))
                 .await
-        {
-            tx.rollback()
-                .await
-                .context("release refresh lock after failed full rebuild")?;
-            metrics::record_index_refresh_duration("failed", started.elapsed());
-            return Err(error);
-        }
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    tx.rollback()
+                        .await
+                        .context("release refresh lock after failed full rebuild")?;
+                    metrics::record_index_refresh_duration("failed", started.elapsed());
+                    return Err(error);
+                }
+            };
         tx.commit()
             .await
             .context("release refresh lock after full rebuild")?;
         metrics::record_index_refresh_duration("full_rebuild", started.elapsed());
-        return Ok(IncrementalRefreshOutcome {
-            lock_acquired: true,
-            full_rebuild_required: true,
-            changed_items: 0,
-            reconciled_deleted_items: 0,
-            skipped_encrypted: 0,
-            skipped_malformed: 0,
-            skipped_wrong_owner: 0,
-        });
+        return Ok(IncrementalRefreshOutcome::from_full_rebuild(
+            rebuild_outcome,
+        ));
     }
 
     mark_stale_if_needed(
@@ -231,35 +335,57 @@ async fn apply_incremental_refresh<S>(
 where
     S: JoplinSource,
 {
-    let changed = source
-        .changed_items_since(&user.joplin_user_id, user.last_seen_joplin_updated_time)
-        .instrument(tracing::info_span!("index.source_query"))
-        .await
-        .context("load changed Joplin items for incremental refresh")?;
-    let changed_items = changed.len();
-    let rows = build_incremental_rows(&user.joplin_user_id, changed);
+    let mut totals = IncrementalTotals::default();
+    let mut after = None;
 
-    async {
-        for row in &rows.deleted {
-            purge_active_row(tx, user.mcp_user_id, row).await?;
-            upsert_deleted_row(tx, user.mcp_user_id, row, "deleted_time").await?;
+    loop {
+        let changed = source
+            .changed_items_batch(
+                &user.joplin_user_id,
+                user.last_seen_joplin_updated_time,
+                after.as_ref(),
+                JOPLIN_ITEM_BATCH_SIZE,
+            )
+            .instrument(tracing::info_span!("index.source_query"))
+            .await
+            .context("load changed Joplin item batch for incremental refresh")?;
+        if changed.is_empty() {
+            break;
         }
-        for row in &rows.active {
-            purge_active_item(tx, user.mcp_user_id, &row.joplin_id, row.item_type).await?;
-            upsert_active_row(tx, user.mcp_user_id, row).await?;
+
+        let batch_len = changed.len();
+        after = changed.last().map(JoplinItemCursor::from);
+        totals.changed_items += batch_len;
+        let rows = build_incremental_rows(&user.joplin_user_id, changed);
+        async {
+            for row in &rows.deleted {
+                purge_active_row(tx, user.mcp_user_id, row).await?;
+                upsert_deleted_row(tx, user.mcp_user_id, row, "deleted_time").await?;
+            }
+            for row in &rows.active {
+                purge_active_item(tx, user.mcp_user_id, &row.joplin_id, row.item_type).await?;
+                upsert_active_row(tx, user.mcp_user_id, row).await?;
+            }
+            anyhow::Ok(())
         }
-        anyhow::Ok(())
+        .instrument(tracing::info_span!("index.row_upserts"))
+        .await?;
+        totals.add_rows(&rows, user.last_seen_joplin_updated_time);
+        if batch_len < JOPLIN_ITEM_BATCH_SIZE as usize {
+            break;
+        }
     }
-    .instrument(tracing::info_span!("index.row_upserts"))
-    .await?;
 
-    let reconciled_deleted_items = reconcile_hard_deletes(tx, source, user).await?;
-    let last_seen = rows.last_seen_joplin_updated_time(user.last_seen_joplin_updated_time);
+    totals.reconciled_deleted_items = reconcile_hard_deletes(tx, source, user).await?;
+    let last_seen = totals
+        .last_seen_joplin_updated_time
+        .or(user.last_seen_joplin_updated_time);
     mark_incremental_ready(
         tx,
         user.mcp_user_id,
         last_seen,
         config.refresh_interval_seconds,
+        totals.changed_items > 0 || totals.reconciled_deleted_items > 0,
     )
     .instrument(tracing::info_span!("index.state_update"))
     .await?;
@@ -270,11 +396,13 @@ where
     Ok(IncrementalRefreshOutcome {
         lock_acquired: true,
         full_rebuild_required: false,
-        changed_items,
-        reconciled_deleted_items,
-        skipped_encrypted: rows.skipped_encrypted,
-        skipped_malformed: rows.skipped_malformed,
-        skipped_wrong_owner: rows.skipped_wrong_owner,
+        changed_items: totals.changed_items,
+        reconciled_deleted_items: totals.reconciled_deleted_items,
+        full_rebuild_indexed_items: 0,
+        full_rebuild_deleted_items: 0,
+        skipped_encrypted: totals.skipped_encrypted,
+        skipped_malformed: totals.skipped_malformed,
+        skipped_wrong_owner: totals.skipped_wrong_owner,
     })
 }
 
@@ -456,17 +584,29 @@ async fn mark_incremental_ready(
     user_id: Uuid,
     last_seen_joplin_updated_time: Option<i64>,
     refresh_interval_seconds: u64,
+    applied_changes: bool,
 ) -> anyhow::Result<()> {
     let _ = refresh_interval_seconds;
     sqlx::query(
         r#"
         INSERT INTO joplin_mcp.index_state
-            (user_id, status, last_incremental_at, last_seen_joplin_updated_time, updated_at)
-        VALUES ($1, $2, now(), $3, now())
+            (user_id, status, last_checked_at, last_incremental_at, last_seen_joplin_updated_time, updated_at)
+        VALUES ($1, $2, now(), CASE WHEN $4 THEN now() ELSE NULL END, $3, now())
         ON CONFLICT (user_id) DO UPDATE
         SET status = EXCLUDED.status,
-            last_incremental_at = EXCLUDED.last_incremental_at,
-            last_seen_joplin_updated_time = EXCLUDED.last_seen_joplin_updated_time,
+            last_checked_at = EXCLUDED.last_checked_at,
+            last_incremental_at = CASE
+                WHEN $4 THEN EXCLUDED.last_incremental_at
+                ELSE joplin_mcp.index_state.last_incremental_at
+            END,
+            last_seen_joplin_updated_time = COALESCE(
+                GREATEST(
+                    joplin_mcp.index_state.last_seen_joplin_updated_time,
+                    EXCLUDED.last_seen_joplin_updated_time
+                ),
+                joplin_mcp.index_state.last_seen_joplin_updated_time,
+                EXCLUDED.last_seen_joplin_updated_time
+            ),
             last_error = NULL,
             updated_at = now()
         "#,
@@ -474,9 +614,45 @@ async fn mark_incremental_ready(
     .bind(user_id)
     .bind(IndexStatus::Ready.as_str())
     .bind(last_seen_joplin_updated_time)
+    .bind(applied_changes)
     .execute(tx.as_mut())
     .await
     .context("mark incremental refresh ready")?;
+
+    Ok(())
+}
+
+pub async fn mark_index_checked(
+    mcp_pool: &PgPool,
+    user_id: Uuid,
+    source_watermark: Option<i64>,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO joplin_mcp.index_state
+            (user_id, status, last_checked_at, last_seen_joplin_updated_time, updated_at)
+        VALUES ($1, $2, now(), $3, now())
+        ON CONFLICT (user_id) DO UPDATE
+        SET status = $2,
+            last_checked_at = now(),
+            last_seen_joplin_updated_time = COALESCE(
+                GREATEST(
+                    joplin_mcp.index_state.last_seen_joplin_updated_time,
+                    EXCLUDED.last_seen_joplin_updated_time
+                ),
+                joplin_mcp.index_state.last_seen_joplin_updated_time,
+                EXCLUDED.last_seen_joplin_updated_time
+            ),
+            last_error = NULL,
+            updated_at = now()
+        "#,
+    )
+    .bind(user_id)
+    .bind(IndexStatus::Ready.as_str())
+    .bind(source_watermark)
+    .execute(mcp_pool)
+    .await
+    .context("mark index checked")?;
 
     Ok(())
 }
@@ -826,6 +1002,14 @@ pub fn requires_full_rebuild(gap_seconds: u64, lookback_cap_seconds: u64) -> boo
     gap_seconds > lookback_cap_seconds
 }
 
+pub fn full_rebuild_due(last_full_rebuild_at: Option<DateTime<Utc>>, interval_hours: u64) -> bool {
+    let Some(last_full_rebuild_at) = last_full_rebuild_at else {
+        return true;
+    };
+    Utc::now().signed_duration_since(last_full_rebuild_at)
+        >= ChronoDuration::hours(interval_hours as i64)
+}
+
 fn refresh_gap_seconds(last_incremental_at: Option<DateTime<Utc>>) -> u64 {
     last_incremental_at
         .map(|last| Utc::now().signed_duration_since(last).num_seconds().max(0) as u64)
@@ -923,6 +1107,16 @@ mod tests {
     fn lookback_cap_triggers_full_rebuild() {
         assert!(requires_full_rebuild(86_401, 86_400));
         assert!(!requires_full_rebuild(86_400, 86_400));
+    }
+
+    #[test]
+    fn full_rebuild_interval_triggers_scheduled_rebuilds() {
+        assert!(full_rebuild_due(None, 24));
+        assert!(full_rebuild_due(Some(Utc::now() - Duration::hours(24)), 24));
+        assert!(!full_rebuild_due(
+            Some(Utc::now() - Duration::hours(23)),
+            24
+        ));
     }
 
     #[test]
@@ -1038,6 +1232,30 @@ mod tests {
     }
 
     #[test]
+    fn full_rebuild_outcome_is_preserved_for_incremental_escalation() {
+        let outcome = IncrementalRefreshOutcome::from_full_rebuild(FullRebuildOutcome {
+            indexed_notes: 2,
+            indexed_notebooks: 3,
+            indexed_tags: 5,
+            indexed_note_tags: 7,
+            indexed_resources: 11,
+            indexed_deleted_items: 13,
+            skipped_encrypted: 17,
+            skipped_malformed: 19,
+            skipped_wrong_owner: 23,
+        });
+
+        assert!(outcome.lock_acquired);
+        assert!(outcome.full_rebuild_required);
+        assert_eq!(outcome.changed_items, 0);
+        assert_eq!(outcome.full_rebuild_indexed_items, 28);
+        assert_eq!(outcome.full_rebuild_deleted_items, 13);
+        assert_eq!(outcome.skipped_encrypted, 17);
+        assert_eq!(outcome.skipped_malformed, 19);
+        assert_eq!(outcome.skipped_wrong_owner, 23);
+    }
+
+    #[test]
     fn live_database_note_content_without_footer_builds_active_row() {
         let mut live_note = item("owner", "live-note", JoplinItemType::Note, "live body");
         live_note.name = "Live title".to_string();
@@ -1084,7 +1302,10 @@ mod tests {
         SELECT
             users.id AS mcp_user_id,
             users.joplin_user_id,
+            state.status,
             state.last_incremental_at,
+            state.last_full_rebuild_at,
+            state.last_checked_at,
             state.last_seen_joplin_updated_time
         FROM joplin_mcp.mcp_users users
         JOIN joplin_mcp.mcp_tokens tokens ON tokens.user_id = users.id
@@ -1097,5 +1318,49 @@ mod tests {
         assert!(query.contains("JOIN joplin_mcp.mcp_tokens"));
         assert!(query.contains("tokens.revoked_at IS NULL"));
         assert!(query.contains("tokens.expires_at IS NULL OR tokens.expires_at > now()"));
+    }
+
+    #[test]
+    fn explicit_refresh_request_creates_due_state_for_missing_index() {
+        assert!(REQUEST_INDEX_REFRESH_NOW_SQL.contains("INSERT INTO joplin_mcp.index_state"));
+        assert!(REQUEST_INDEX_REFRESH_NOW_SQL.contains("(user_id, status, last_checked_at"));
+        assert!(REQUEST_INDEX_REFRESH_NOW_SQL.contains("VALUES ($1, $2, NULL, now())"));
+        assert!(REQUEST_INDEX_REFRESH_NOW_SQL.contains("SET last_checked_at = NULL"));
+        assert!(REQUEST_INDEX_REFRESH_NOW_SQL.contains("status <> $3"));
+    }
+
+    #[test]
+    fn refresh_needed_uses_source_watermark_without_forcing_no_change_apply() {
+        let config = IndexConfig::default();
+        let user = RefreshUser {
+            mcp_user_id: Uuid::new_v4(),
+            joplin_user_id: "joplin-user".to_string(),
+            status: Some("ready".to_string()),
+            last_incremental_at: Some(Utc::now()),
+            last_full_rebuild_at: Some(Utc::now()),
+            last_checked_at: Some(Utc::now()),
+            last_seen_joplin_updated_time: Some(10),
+        };
+
+        assert!(!refresh_needed(&user, Some(10), &config));
+        assert!(refresh_needed(&user, Some(11), &config));
+    }
+
+    #[test]
+    fn refresh_needed_rebuilds_missing_or_failed_state() {
+        let config = IndexConfig::default();
+        let mut user = RefreshUser {
+            mcp_user_id: Uuid::new_v4(),
+            joplin_user_id: "joplin-user".to_string(),
+            status: None,
+            last_incremental_at: Some(Utc::now()),
+            last_full_rebuild_at: Some(Utc::now()),
+            last_checked_at: Some(Utc::now()),
+            last_seen_joplin_updated_time: None,
+        };
+
+        assert!(refresh_needed(&user, None, &config));
+        user.status = Some("failed".to_string());
+        assert!(refresh_needed(&user, None, &config));
     }
 }

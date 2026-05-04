@@ -6,6 +6,7 @@ This document records the v1 metric, trace, and alert contract. Labels must stay
 
 - `index_lag_seconds`: histogram by `user.hash`.
 - `index_refresh_duration_seconds`: histogram by `outcome`.
+- `index_worker_cycle_users_total`: counter by `kind`; allowed worker-cycle kinds are `checked`, `refreshed`, `skipped_current`, `skipped_lock`, `failed`, `skipped_encrypted`, `skipped_malformed`, `skipped_wrong_owner`, `full_rebuild_indexed_items`, and `full_rebuild_deleted_items`.
 - `mcp_tool_duration_seconds`: histogram by `tool`.
 - `mcp_tool_errors_total`: counter by `tool` and `error.kind`.
 - `bootstrap_login_total`: counter by `outcome`.
@@ -16,6 +17,10 @@ This document records the v1 metric, trace, and alert contract. Labels must stay
 - Bootstrap login: `bootstrap.login`, `bootstrap.joplin_auth`, `bootstrap.user_resolve`, `bootstrap.user_upsert`, `bootstrap.token_mint`.
 - Index refresh: `index.refresh`, `index.source_query`, `index.row_upserts`, `index.state_update`, with `index.full_rebuild` when a rebuild is required.
 - MCP tool call: `mcp.tool_call`.
+
+## Index Memory
+
+- Joplin source reads use keyset batches of 500 raw items before parsing/upserting. This bounds live note-body fetches during full rebuild and incremental refresh.
 
 ## Minimum Alerts
 

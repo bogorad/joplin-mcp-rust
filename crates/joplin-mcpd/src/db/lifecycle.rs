@@ -1,17 +1,24 @@
 use anyhow::{Context, bail};
+use sqlx::PgConnection;
 
 pub const SINGLETON_LOCK_KEY: i64 = 0x6a_6f_70_6c_69_6e_6d_63;
 
 #[derive(Debug)]
 pub struct SingletonLock {
-    pool: sqlx::PgPool,
+    _conn: PgConnection,
 }
 
 impl SingletonLock {
     pub async fn acquire(pool: &sqlx::PgPool) -> anyhow::Result<Self> {
+        let mut conn = pool
+            .acquire()
+            .await
+            .context("acquire singleton lock database connection")?
+            .detach();
+
         let acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
             .bind(SINGLETON_LOCK_KEY)
-            .fetch_one(pool)
+            .fetch_one(&mut conn)
             .await
             .context("acquire singleton advisory lock")?;
 
@@ -19,19 +26,7 @@ impl SingletonLock {
             bail!("another joplin-mcpd instance holds the singleton lock");
         }
 
-        Ok(Self { pool: pool.clone() })
-    }
-}
-
-impl Drop for SingletonLock {
-    fn drop(&mut self) {
-        let pool = self.pool.clone();
-        tokio::spawn(async move {
-            let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-                .bind(SINGLETON_LOCK_KEY)
-                .execute(&pool)
-                .await;
-        });
+        Ok(Self { _conn: conn })
     }
 }
 

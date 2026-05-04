@@ -5,12 +5,13 @@ use joplin_mcpd::{
     config::Config,
     db::{lifecycle::SingletonLock, migrations, schema_check::validate_joplin_source_schema},
     http::{ApiBackend, serve_with_backends},
+    indexer::{source::JoplinDbSource, worker::spawn_index_worker},
     lifecycle::{Readiness, ReadinessStatus},
     logging::init_logging,
     mcp::transport::McpAuth,
     observability::metrics,
 };
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 
 #[derive(Debug, Parser)]
@@ -55,7 +56,14 @@ async fn main() -> anyhow::Result<()> {
         hmac_keys,
         active_hmac_key,
     };
+    let index_worker = spawn_index_worker(
+        mcp_pool.clone(),
+        JoplinDbSource::new(joplin_pool.clone()),
+        config.index.clone(),
+    );
     serve_with_backends(config, readiness, mcp_auth, api_backend).await?;
+    index_worker.abort();
+    let _ = index_worker.await;
     drop(singleton_lock);
     joplin_pool.close().await;
     mcp_pool.close().await;
@@ -95,7 +103,10 @@ async fn connect_mcp_pool(config: &Config) -> anyhow::Result<sqlx::PgPool> {
     let pool = PgPoolOptions::new()
         .max_connections(config.postgres.runtime_max_connections)
         .acquire_timeout(Duration::from_secs(config.postgres.acquire_timeout_seconds))
-        .connect(dsn.trim())
+        .connect_with(postgres_connect_options(
+            dsn.trim(),
+            config.postgres.statement_timeout_seconds,
+        )?)
         .await
         .context("connect to MCP database")?;
     metrics::record_postgres_pool_wait("runtime", started.elapsed());
@@ -113,9 +124,52 @@ async fn connect_joplin_pool(config: &Config) -> anyhow::Result<sqlx::PgPool> {
     let pool = PgPoolOptions::new()
         .max_connections(config.postgres.indexer_max_connections)
         .acquire_timeout(Duration::from_secs(config.postgres.acquire_timeout_seconds))
-        .connect(dsn.trim())
+        .connect_with(postgres_connect_options(
+            dsn.trim(),
+            config.postgres.statement_timeout_seconds,
+        )?)
         .await
         .context("connect to Joplin source database")?;
     metrics::record_postgres_pool_wait("indexer", started.elapsed());
     Ok(pool)
+}
+
+fn postgres_connect_options(
+    dsn: &str,
+    statement_timeout_seconds: u64,
+) -> anyhow::Result<PgConnectOptions> {
+    let statement_timeout_millis = statement_timeout_seconds
+        .checked_mul(1000)
+        .context("postgres.statement_timeout_seconds is too large")?;
+    Ok(dsn
+        .parse::<PgConnectOptions>()
+        .context("parse postgres DSN credential")?
+        .options([("statement_timeout", statement_timeout_millis)]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn postgres_connect_options_applies_statement_timeout_in_milliseconds() {
+        let options = postgres_connect_options("postgres://mcp_user:secret@127.0.0.1/mcp_db", 15)
+            .expect("connect options are built");
+
+        assert_eq!(options.get_options(), Some("-c statement_timeout=15000"));
+    }
+
+    #[test]
+    fn postgres_connect_options_preserves_existing_startup_options() {
+        let options = postgres_connect_options(
+            "postgres://joplin_user:secret@127.0.0.1/joplin_db?options=-c%20geqo=off",
+            2,
+        )
+        .expect("connect options are built");
+
+        assert_eq!(
+            options.get_options(),
+            Some("-c geqo=off -c statement_timeout=2000")
+        );
+    }
 }

@@ -4,11 +4,12 @@ use joplin_mcpd::{
         HttpJoplinAuthenticator, JoplinAuthenticator, resolve_joplin_user_by_id,
         upsert_mcp_user_by_joplin_user,
     },
+    config::IndexConfig,
     db::{migrations, schema_check::validate_joplin_source_schema},
     indexer::{
         JoplinItemType,
-        rebuild::full_rebuild_user,
         source::{JoplinDbSource, JoplinSource},
+        worker::run_index_refresh_cycle,
     },
     observability::victorialogs::VictoriaLogsHarness,
 };
@@ -22,6 +23,7 @@ use std::{
     process::Command,
     time::Duration,
 };
+use uuid::Uuid;
 
 const LIVE_JOPLIN_ENV: &str = "JP_MCP_LIVE_JOPLIN";
 const LIVE_POSTGRES_HOST_OVERRIDE_ENV: &str = "JP_MCP_LIVE_POSTGRES_HOST";
@@ -86,6 +88,8 @@ async fn validates_real_joplin_indexer_contract() -> anyhow::Result<()> {
         .invalidate_session(&session.id)
         .await
         .context("invalidate temporary Joplin session")?;
+    ensure_active_test_token(&mcp_pool, mcp_user.id).await?;
+    reset_index_for_user(&mcp_pool, mcp_user.id).await?;
 
     let source = JoplinDbSource::new(joplin_pool.clone());
     let items = source
@@ -115,9 +119,23 @@ async fn validates_real_joplin_indexer_contract() -> anyhow::Result<()> {
         "real Joplin source has no unencrypted note content to validate"
     );
 
-    let outcome = full_rebuild_user(&mcp_pool, &source, mcp_user.id, &joplin_user.id)
-        .await
-        .context("full rebuild real Joplin index")?;
+    let index_config = IndexConfig {
+        max_parallel_users: 1,
+        refresh_interval_seconds: 1,
+        ..IndexConfig::default()
+    };
+    run_index_refresh_cycle(&mcp_pool, &source, &index_config).await;
+
+    let index_status: String =
+        sqlx::query_scalar("SELECT status FROM joplin_mcp.index_state WHERE user_id = $1")
+            .bind(mcp_user.id)
+            .fetch_one(&mcp_pool)
+            .await
+            .context("read daemon-driven index status")?;
+    ensure!(
+        index_status == "ready",
+        "daemon-driven index refresh did not reach ready status"
+    );
 
     let indexed_notes: i64 =
         sqlx::query_scalar("SELECT count(*) FROM joplin_mcp.notes_index WHERE user_id = $1")
@@ -126,12 +144,8 @@ async fn validates_real_joplin_indexer_contract() -> anyhow::Result<()> {
             .await
             .context("count indexed real Joplin notes")?;
     ensure!(
-        indexed_notes as usize == outcome.indexed_notes,
-        "indexed note count differs from rebuild outcome"
-    );
-    ensure!(
         indexed_notes > 0,
-        "live Joplin note content indexed zero rows"
+        "daemon-driven live Joplin note content indexed zero rows"
     );
 
     let indexed_tags: i64 =
@@ -140,12 +154,11 @@ async fn validates_real_joplin_indexer_contract() -> anyhow::Result<()> {
             .fetch_one(&mcp_pool)
             .await
             .context("count indexed real Joplin tags")?;
-    ensure!(
-        indexed_tags as usize == outcome.indexed_tags,
-        "indexed tag count differs from rebuild outcome"
-    );
     if source_tags > 0 {
-        ensure!(indexed_tags > 0, "live Joplin tags indexed zero rows");
+        ensure!(
+            indexed_tags > 0,
+            "daemon-driven live Joplin tags indexed zero rows"
+        );
     }
 
     let indexed_note_tags: i64 =
@@ -154,25 +167,12 @@ async fn validates_real_joplin_indexer_contract() -> anyhow::Result<()> {
             .fetch_one(&mcp_pool)
             .await
             .context("count indexed real Joplin tag edges")?;
-    ensure!(
-        indexed_note_tags as usize == outcome.indexed_note_tags,
-        "indexed tag edge count differs from rebuild outcome"
-    );
     if source_note_tags > 0 {
         ensure!(
             indexed_note_tags > 0,
-            "live Joplin tag edges indexed zero rows"
+            "daemon-driven live Joplin tag edges indexed zero rows"
         );
     }
-
-    let encrypted_source_notes = items
-        .iter()
-        .filter(|item| item.item_type == JoplinItemType::Note && item.encrypted)
-        .count();
-    ensure!(
-        outcome.skipped_encrypted >= encrypted_source_notes,
-        "encrypted source notes were not reported as skipped"
-    );
 
     assert_no_other_owner_notes(&mcp_pool, &source, mcp_user.id, &joplin_user.id).await?;
     assert_tag_edges_reference_indexed_rows(&mcp_pool, mcp_user.id).await?;
@@ -190,6 +190,45 @@ async fn validates_real_joplin_indexer_contract() -> anyhow::Result<()> {
 
     joplin_pool.close().await;
     mcp_pool.close().await;
+    Ok(())
+}
+
+async fn ensure_active_test_token(pool: &sqlx::PgPool, user_id: Uuid) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO joplin_mcp.mcp_tokens
+            (id, user_id, token_hash, hmac_key_id, label, scope)
+        VALUES ($1, $2, $3, 'live-test', 'real-joplin-test', 'read')
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(user_id)
+    .bind(Uuid::new_v4().as_bytes().to_vec())
+    .execute(pool)
+    .await
+    .context("create active MCP token for daemon-driven live index test")?;
+
+    Ok(())
+}
+
+async fn reset_index_for_user(pool: &sqlx::PgPool, user_id: Uuid) -> anyhow::Result<()> {
+    for table in [
+        "notes_index",
+        "notebooks_index",
+        "tags_index",
+        "note_tags_index",
+        "resources_index",
+        "deleted_items_index",
+        "index_state",
+    ] {
+        let sql = format!("DELETE FROM joplin_mcp.{table} WHERE user_id = $1");
+        sqlx::query(&sql)
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .with_context(|| format!("reset derived index table {table}"))?;
+    }
+
     Ok(())
 }
 
