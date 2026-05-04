@@ -1,1 +1,2 @@
 dolt.database: "joplin_mcp_rust"
+issue_prefix: "jmr-"

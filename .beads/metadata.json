@@ -2,6 +2,9 @@
   "database": "dolt",
   "backend": "dolt",
   "dolt_mode": "server",
+  "dolt_server_host": "doltsrv.lan",
+  "dolt_server_port": 3307,
+  "dolt_server_user": "root",
   "dolt_database": "joplin_mcp_rust",
   "project_id": "19fff351-c492-4c7b-83fb-e2c2020a6a82"
 }
