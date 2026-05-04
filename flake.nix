@@ -33,6 +33,7 @@
             git
             jq
             just
+            nodejs_25
             pkg-config
             postgresql_17
             protobuf

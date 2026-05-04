@@ -9,7 +9,7 @@
 ## Tooling On NixOS
 
 - Prefer `nix develop` for project work.
-- If a required tool is missing from `PATH`, use Nix instead of installing it globally.
+- If a required tool is missing from `PATH`, use Nix native tools instead of installing it globally.
 - Use `nix run nixpkgs#<package> -- <args>` for one-off tools when the executable name matches the package.
 - Use `nix shell nixpkgs#<package> -c <command> <args>` when the executable name differs or multiple tools are needed.
 - Put durable project tooling in `flake.nix`.
