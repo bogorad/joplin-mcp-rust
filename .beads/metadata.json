@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_database": "joplin_mcp_rust",
+  "project_id": "19fff351-c492-4c7b-83fb-e2c2020a6a82"
+}
