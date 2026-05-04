@@ -22,6 +22,7 @@
 - VictoriaLogs for local/live testing is `http://victorialogs.lan:9428`.
 - The planned local compose file is `tests/compose.local.yaml`.
 - Prefer `just` commands once the repository has a `Justfile`.
+- Every time a material change is made, bump version number zz in xx.yy.zz, in all relevant files.
 
 ## Beads
 
