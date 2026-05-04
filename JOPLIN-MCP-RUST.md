@@ -249,18 +249,21 @@ sops -d secrets.yaml | yq '.postgres|keys'
 
 - host
 - port
-- database
+- joplin_database
 - joplin_user
 - joplin_password
+- mcp_database
 - mcp_user
 - mcp_password
 ```
 
 Test code may assemble Postgres DSNs from those keys only after decrypting with
-SOPS. `postgres.joplin_user`/`postgres.joplin_password` are for read-only access
-to canonical Joplin tables. `postgres.mcp_user`/`postgres.mcp_password` are for
-the `joplin_mcp` schema and MCP-owned tables only. Do not reuse one role for the
-other access path.
+SOPS. `postgres.joplin_database` is the canonical Joplin Server database and
+must be accessed with `postgres.joplin_user`/`postgres.joplin_password` for
+read-only access to Joplin tables. `postgres.mcp_database` is the separate MCP
+database and must be accessed with `postgres.mcp_user`/`postgres.mcp_password`
+for the `joplin_mcp` schema and MCP-owned tables. Do not reuse one database or
+one role for the other access path.
 
 If `secrets.yaml` is absent or the keys are missing, real-Joplin/Postgres tests
 must skip unless the test target explicitly requires live credentials.
@@ -523,6 +526,12 @@ email_display = "redacted"
 
 Do not store per-user Joplin passwords here.
 
+`postgres.joplin_dsn_file` must point at `postgres.joplin_database` using the
+`postgres.joplin_user` role. `postgres.mcp_dsn_file` must point at
+`postgres.mcp_database` using the `postgres.mcp_user` role. Startup must reject
+a configuration where both DSNs target the same database or where either role is
+used for the wrong database.
+
 Reverse-proxy IP policy:
 
 ```text
@@ -685,8 +694,9 @@ Create a separate schema.
 CREATE SCHEMA IF NOT EXISTS joplin_mcp;
 ```
 
-Create, migrate, read, and write this schema through the `mcp_user` Postgres
-connection. Do not use `joplin_user` for `joplin_mcp` tables.
+Create, migrate, read, and write this schema in `postgres.mcp_database` through
+the `mcp_user` Postgres connection. Do not create `joplin_mcp` tables in the
+Joplin Server database. Do not use `joplin_user` for `joplin_mcp` tables.
 
 Do not add columns to Joplin tables. Do not add triggers to Joplin tables in v1.
 Do not add indexes to Joplin tables unless measurement proves a need.
@@ -927,8 +937,9 @@ trait JoplinSource {
 }
 ```
 
-Direct source reads must use the `joplin_user` Postgres connection. The source
-trait must not read from or write to `joplin_mcp` tables.
+Direct source reads must use the `joplin_user` Postgres connection to
+`postgres.joplin_database`. The source trait must not read from or write to
+`joplin_mcp` tables in `postgres.mcp_database`.
 
 The first implementation is `JoplinDbSource`. A future `JoplinApiSource` may use
 Joplin's delta sync API, but it is not required for v1.
@@ -1046,8 +1057,8 @@ Concurrency rules:
 ```text
 1. take a per-user advisory lock before refresh or rebuild
 2. skip or reschedule if another worker owns that user
-3. read canonical Joplin rows through the joplin_user connection only
-4. write derived rows through the mcp_user connection only
+3. read canonical Joplin rows from postgres.joplin_database through the joplin_user connection only
+4. write derived rows to postgres.mcp_database through the mcp_user connection only
 5. run background indexing through postgres.indexer_max_connections only
 6. keep foreground MCP/auth/status reads on postgres.runtime_max_connections
 7. cap rebuild work by row count, max_parallel_users, and indexer DB capacity
@@ -1734,7 +1745,7 @@ search tool returns only current user's notes
 get_note rejects another user's note ID
 index failure leaves prior ready index in place
 two refresh jobs for one user do not corrupt index state
-second server instance against same database fails startup
+second server instance against the same MCP database fails startup
 external content storage detection fails startup
 request and tool timeouts are enforced
 shutdown drains in-flight requests and flushes logs
@@ -1786,6 +1797,65 @@ auth endpoint, it must load test-only `.joplin.url`, `.joplin.username`,
 `.joplin.password`, and the required `.postgres.*` keys from `secrets.yaml` via
 SOPS and must not emit those values.
 
+### Required Build And Test Commands
+
+The repository must provide a Rust/Nix development surface where these commands
+work from the repository root:
+
+```text
+nix develop
+cargo fmt --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo build --workspace
+cargo test --workspace
+nix flake check
+nix build .#joplin-mcpd
+nix build .#joplin-mcp-client
+```
+
+The repository must also provide stable test aliases for agents and humans:
+
+```text
+just fmt
+just check
+just test-unit
+just test-db
+just test-server
+just test-client
+just test-e2e
+just test-all-local
+JP_MCP_LIVE_JOPLIN=1 just test-real-joplin
+```
+
+`just test-all-local` must not decrypt `secrets.yaml` and must not require a
+real Joplin Server. It may start local disposable services needed for tests, but
+those services must use generated fixture credentials, not repo SOPS secrets.
+
+`just test-real-joplin` is the only required command that may decrypt
+`secrets.yaml`. It must require `JP_MCP_LIVE_JOPLIN=1`, must build two Postgres
+DSNs from the split `.postgres.*` key set, and must fail before running if
+`postgres.joplin_database == postgres.mcp_database`. It must use the shared
+VictoriaLogs instance at:
+
+```text
+http://victorialogs.lan:9428
+```
+
+Live tests must send OTLP logs to
+`http://victorialogs.lan:9428/insert/opentelemetry/v1/logs` and query
+`http://victorialogs.lan:9428/select/logsql/query`.
+
+The implementation must provide this local service runner:
+
+```text
+tests/compose.local.yaml
+```
+
+It must start disposable Postgres, fake Joplin auth, and local disposable
+VictoriaLogs for local integration/e2e tests. A Nix-native runner may be added
+later, but `tests/compose.local.yaml` and the same `just test-*` aliases must
+remain supported.
+
 ## 21. Fail-Early Rules
 
 The server must refuse to start if:
@@ -1793,6 +1863,7 @@ The server must refuse to start if:
 ```text
 OTLP logging config is invalid
 one or both Postgres DSNs are missing
+both Postgres DSNs target the same database
 Postgres connection fails
 required joplin_mcp migrations are missing
 _sqlx_migrations records a newer version than the binary supports
@@ -1879,14 +1950,16 @@ Joplin failures.
 
 ### SQL Access
 
-The MCP server uses separate Postgres credentials for Joplin-owned data and
-MCP-owned data.
+The MCP server uses separate Postgres databases and credentials for
+Joplin-owned data and MCP-owned data.
 
 `joplin_user` must have:
 
 ```text
-read access to required canonical Joplin tables
+connect access to postgres.joplin_database
+read access to required canonical Joplin tables in postgres.joplin_database
 no write access to Joplin tables
+no access to postgres.mcp_database
 no access to joplin_mcp tables unless explicitly required for inspection
 no schema ownership over Joplin tables
 no superuser
@@ -1895,16 +1968,19 @@ no superuser
 `mcp_user` must have:
 
 ```text
-read/write access to the joplin_mcp schema
-permission to run joplin_mcp migrations
+connect access to postgres.mcp_database
+read/write access to the joplin_mcp schema in postgres.mcp_database
+permission to run joplin_mcp migrations in postgres.mcp_database
+no access to postgres.joplin_database
 no access to canonical Joplin tables
 no schema ownership over Joplin tables
 no superuser
 ```
 
-Code must use the `joplin_user` connection for direct Joplin table reads and the
-`mcp_user` connection for MCP tables, tokens, audit log, derived indexes, and
-migrations. Do not collapse these into one role in v1.
+Code must use the `joplin_user` connection for direct Joplin table reads in the
+Joplin database and the `mcp_user` connection for MCP tables, tokens, audit log,
+derived indexes, and migrations in the MCP database. Do not collapse these into
+one database or one role in v1.
 
 ### Logs
 
@@ -2065,8 +2141,8 @@ Deliver:
 read real users table
 authenticate against real Joplin Server
 load real-Joplin and Postgres test credentials from SOPS secrets.yaml without logging them
-use postgres.joplin_user for canonical Joplin table reads
-use postgres.mcp_user for joplin_mcp tables and derived index writes
+use postgres.joplin_database with postgres.joplin_user for canonical Joplin table reads
+use postgres.mcp_database with postgres.mcp_user for joplin_mcp tables and derived index writes
 resolve real joplin_user_id from Joplin session response
 verify changed Joplin email refreshes mcp_users
 verify temporary Joplin session is invalidated after bootstrap
@@ -2176,3 +2252,7 @@ startup fails early on bad DB/schema/token/logging config
   sqlx schema-version gating, HMAC key format, external-storage detection,
   stale/tombstone index behavior, single-instance operation, timeouts, shutdown
   drain, reverse-proxy IP handling, and backup boundaries.
+- Split live Postgres testing and runtime access into separate Joplin and MCP
+  databases with separate SOPS keys, DSNs, users, and fail-fast validation.
+- Added required build/test command contract: cargo, Nix, Justfile aliases,
+  local compose runner, and explicit live-Joplin opt-in.

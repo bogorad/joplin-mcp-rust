@@ -1,5 +1,5 @@
 {
-  description = "DevEnv for joplin-mcp-rust";
+  description = "Development environment for joplin-mcp-rust";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -17,31 +17,51 @@
       let
         pkgs = import nixpkgs {
           inherit system;
-          # Allow unfree packages used by tooling in this dev shell (yc).
           config.allowUnfree = true;
         };
       in
       {
+        formatter = pkgs.nixfmt;
+
         devShells.default = pkgs.mkShell {
-          packages = with pkgs; [
-            nodejs_25 # node runtime
+          nativeBuildInputs = with pkgs; [
+            cargo
+            cargo-nextest
+            cargo-watch
+            clippy
+            docker-compose
+            git
+            jq
+            just
+            pkg-config
+            postgresql_17
+            protobuf
+            ripgrep
+            rust-analyzer
+            rustc
+            rustfmt
+            sops
+            sqlx-cli
+            yq-go
           ];
 
-          shell = "${pkgs.zsh}/bin/zsh";
+          buildInputs = with pkgs; [
+            openssl
+          ];
+
+          env = {
+            OPENSSL_NO_VENDOR = "1";
+            OTLP_LOGS_ENABLED = "true";
+            OTLP_LOGS_ENDPOINT = "http://victorialogs.lan:9428/insert/opentelemetry/v1/logs";
+            OTLP_TEST_MODE = "true";
+            RUST_BACKTRACE = "1";
+            RUST_LOG = "info";
+            VICTORIALOGS_URL = "http://victorialogs.lan:9428";
+          };
 
           shellHook = ''
-            # Automatically install dependencies with pnpm if not already installed
-            if [ ! -d "node_modules" ]; then
-              echo "Running 'pnpm install' for you..."
-              pnpm install
-            fi
-
-            export OTLP_LOGS_ENABLED="true"
-            export OTLP_TEST_MODE="true"
-            export OTLP_LOGS_ENDPOINT="http://victorialogs.lan:9428/insert/opentelemetry/v1/logs"
-            echo "================================="
-            echo "Hi!"
-            echo "================================="
+            echo "joplin-mcp-rust dev shell"
+            echo "Rust: $(rustc --version)"
           '';
         };
       }
