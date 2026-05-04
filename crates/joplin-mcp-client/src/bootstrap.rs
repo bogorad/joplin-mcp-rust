@@ -1,40 +1,67 @@
-use crate::{config::BootstrapOptions, token_file::write_token};
+use crate::{
+    api::{BootstrapRequest, ClientApi},
+    config::BootstrapOptions,
+    token_file::{read_token, write_token},
+};
 use anyhow::{Context, bail};
-use serde::{Deserialize, Serialize};
-use std::io::Read;
-
-#[derive(Debug, Serialize)]
-struct BootstrapRequest<'a> {
-    email: &'a str,
-    password: &'a str,
-    client_label: &'a str,
-}
-
-#[derive(Debug, Deserialize)]
-struct BootstrapResponse {
-    token: String,
-}
+use std::{io::Read, process::Command};
 
 pub async fn bootstrap(options: BootstrapOptions) -> anyhow::Result<()> {
+    let api = ClientApi::new(&options.client)?;
+    let token_file = options.client.token_file()?;
+    if token_file.exists() {
+        let token = read_token(&token_file)?;
+        if api.check_token(&token).await? {
+            tracing::info!(
+                test.id = options.client.test_id.as_deref().unwrap_or(""),
+                client.label = %options.client_label,
+                operation = "bootstrap_login",
+                outcome = "reused_token",
+                "valid existing token reused"
+            );
+            if options.print_token {
+                println!("{token}");
+            }
+            return Ok(());
+        }
+    }
+
     let password = read_password(&options)?;
-    let server_url = options.client.server_url()?.join("/api/bootstrap/login")?;
-    let response = reqwest::Client::new()
-        .post(server_url)
-        .json(&BootstrapRequest {
+    tracing::info!(
+        test.id = options.client.test_id.as_deref().unwrap_or(""),
+        client.label = %options.client_label,
+        operation = "bootstrap_login",
+        outcome = "started",
+        "bootstrap login started"
+    );
+    let body = match api
+        .bootstrap_login(&BootstrapRequest {
             email: &options.email,
             password: &password,
             client_label: &options.client_label,
         })
-        .send()
         .await
-        .context("send bootstrap request")?;
-
-    if !response.status().is_success() {
-        bail!("bootstrap failed");
-    }
-
-    let body = response.json::<BootstrapResponse>().await?;
-    write_token(&options.client.token_file()?, &body.token)?;
+    {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::warn!(
+                test.id = options.client.test_id.as_deref().unwrap_or(""),
+                client.label = %options.client_label,
+                operation = "bootstrap_login",
+                outcome = "failed",
+                "bootstrap login failed"
+            );
+            return Err(error);
+        }
+    };
+    write_token(&token_file, &body.token)?;
+    tracing::info!(
+        test.id = options.client.test_id.as_deref().unwrap_or(""),
+        client.label = %options.client_label,
+        operation = "bootstrap_login",
+        outcome = "completed",
+        "bootstrap login completed"
+    );
     if options.print_token {
         println!("{}", body.token);
     }
@@ -48,10 +75,24 @@ fn read_password(options: &BootstrapOptions) -> anyhow::Result<String> {
         return Ok(password.trim_end_matches(['\r', '\n']).to_string());
     }
     if options.password_command.is_some() {
-        bail!("--password-command is not implemented yet");
+        let command = options.password_command.as_deref().expect("checked");
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .output()
+            .context("run password command")?;
+        if !output.status.success() {
+            bail!("password command failed");
+        }
+        return String::from_utf8(output.stdout)
+            .context("password command output is not UTF-8")
+            .map(|password| password.trim_end_matches(['\r', '\n']).to_string());
     }
     if options.prompt_password {
-        bail!("--prompt-password is not implemented yet");
+        eprint!("Joplin password: ");
+        let mut password = String::new();
+        std::io::stdin().read_line(&mut password)?;
+        return Ok(password.trim_end_matches(['\r', '\n']).to_string());
     }
     bail!("one password source is required");
 }

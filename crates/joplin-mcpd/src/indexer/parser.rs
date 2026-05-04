@@ -1,14 +1,17 @@
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::{BTreeSet, HashMap};
+use thiserror::Error;
 
 static ID_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^id:\s+[0-9a-f]{32}$").expect("valid id regex"));
 static FOOTER_LINE_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^[A-Za-z0-9_]+:\s*.*$").expect("valid footer regex"));
 static RESOURCE_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#":/([0-9a-f]{32})|src=["']:/([0-9a-f]{32})["']"#).expect("valid resource regex")
+    Regex::new(r#"\(:/([0-9a-f]{32})\)|src=["']:/([0-9a-f]{32})["']"#)
+        .expect("valid resource regex")
 });
+static REQUIRED_KEYS: &[&str] = &["id", "type_", "created_time", "updated_time"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedItem {
@@ -17,28 +20,51 @@ pub struct ParsedItem {
     pub metadata: HashMap<String, String>,
 }
 
-pub fn parse_joplin_item(raw: &str) -> anyhow::Result<ParsedItem> {
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ParseItemError {
+    #[error("missing metadata footer")]
+    MissingMetadataFooter,
+    #[error("missing title")]
+    MissingTitle,
+    #[error("invalid metadata line")]
+    InvalidMetadataLine,
+    #[error("duplicated metadata key {key}")]
+    DuplicatedMetadataKey { key: String },
+    #[error("missing required metadata key {key}")]
+    MissingRequiredMetadataKey { key: &'static str },
+}
+
+pub fn parse_joplin_item(raw: &str) -> Result<ParsedItem, ParseItemError> {
     let lines: Vec<&str> = raw.lines().collect();
-    let metadata_start = lines
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(idx, line)| {
-            if ID_RE.is_match(line.trim())
-                && is_valid_metadata_footer(&lines[idx..])
-                && !has_adjacent_required_key_duplicate(&lines, idx)
-            {
-                Some(idx)
-            } else {
-                None
+    let mut footer_error = None;
+    let mut metadata_start = None;
+
+    for (idx, line) in lines.iter().enumerate().rev() {
+        if !ID_RE.is_match(line.trim()) {
+            continue;
+        }
+
+        match validate_metadata_footer(&lines[idx..]) {
+            Ok(()) if !has_adjacent_required_key_duplicate(&lines, idx) => {
+                metadata_start = Some(idx);
+                break;
             }
-        })
-        .ok_or_else(|| anyhow::anyhow!("missing metadata footer"))?;
+            Ok(()) => {
+                footer_error = Some(ParseItemError::DuplicatedMetadataKey {
+                    key: "required footer key".to_string(),
+                });
+            }
+            Err(err) => footer_error = Some(err),
+        }
+    }
+
+    let metadata_start = metadata_start
+        .ok_or_else(|| footer_error.unwrap_or(ParseItemError::MissingMetadataFooter))?;
 
     let title_pos = lines[..metadata_start]
         .iter()
         .position(|line| !line.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("missing title"))?;
+        .ok_or(ParseItemError::MissingTitle)?;
 
     let title = lines[title_pos].trim().to_string();
     let body = lines[(title_pos + 1)..metadata_start]
@@ -48,14 +74,19 @@ pub fn parse_joplin_item(raw: &str) -> anyhow::Result<ParsedItem> {
 
     let mut metadata = HashMap::new();
     for line in &lines[metadata_start..] {
+        if line.trim().is_empty() {
+            continue;
+        }
         let (key, value) = line
             .split_once(':')
-            .ok_or_else(|| anyhow::anyhow!("invalid metadata line"))?;
+            .ok_or(ParseItemError::InvalidMetadataLine)?;
         if metadata
             .insert(key.trim().to_string(), value.trim().to_string())
             .is_some()
         {
-            anyhow::bail!("duplicated metadata key {key}");
+            return Err(ParseItemError::DuplicatedMetadataKey {
+                key: key.trim().to_string(),
+            });
         }
     }
 
@@ -66,9 +97,9 @@ pub fn parse_joplin_item(raw: &str) -> anyhow::Result<ParsedItem> {
     })
 }
 
-fn is_valid_metadata_footer(lines: &[&str]) -> bool {
+fn validate_metadata_footer(lines: &[&str]) -> Result<(), ParseItemError> {
     if lines.is_empty() {
-        return false;
+        return Err(ParseItemError::MissingMetadataFooter);
     }
 
     let mut keys = BTreeSet::new();
@@ -78,19 +109,25 @@ fn is_valid_metadata_footer(lines: &[&str]) -> bool {
             continue;
         }
         if !FOOTER_LINE_RE.is_match(trimmed) {
-            return false;
+            return Err(ParseItemError::InvalidMetadataLine);
         }
         let Some((key, _)) = trimmed.split_once(':') else {
-            return false;
+            return Err(ParseItemError::InvalidMetadataLine);
         };
         if !keys.insert(key.trim()) {
-            return false;
+            return Err(ParseItemError::DuplicatedMetadataKey {
+                key: key.trim().to_string(),
+            });
         }
     }
 
-    ["id", "type_", "created_time", "updated_time"]
-        .iter()
-        .all(|key| keys.contains(key))
+    for key in REQUIRED_KEYS {
+        if !keys.contains(key) {
+            return Err(ParseItemError::MissingRequiredMetadataKey { key });
+        }
+    }
+
+    Ok(())
 }
 
 fn has_adjacent_required_key_duplicate(lines: &[&str], candidate_idx: usize) -> bool {
@@ -108,9 +145,7 @@ fn has_adjacent_required_key_duplicate(lines: &[&str], candidate_idx: usize) -> 
             return false;
         };
         let key = key.trim();
-        if ["id", "type_", "created_time", "updated_time"].contains(&key)
-            && footer_keys.contains(key)
-        {
+        if REQUIRED_KEYS.contains(&key) && footer_keys.contains(key) {
             return true;
         }
     }
@@ -155,17 +190,44 @@ mod tests {
     }
 
     #[test]
+    fn parses_notebook_item() {
+        let raw = "Notebook title\n\nid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nparent_id: \ncreated_time: 1\nupdated_time: 2\ntype_: 2\n";
+        let parsed = parse_joplin_item(raw).expect("valid notebook item");
+        assert_eq!(parsed.title, "Notebook title");
+        assert_eq!(parsed.body, "");
+        assert_eq!(parsed.metadata.get("parent_id"), Some(&String::new()));
+        assert_eq!(parsed.metadata.get("type_"), Some(&"2".to_string()));
+    }
+
+    #[test]
+    fn rejects_malformed_item_without_footer() {
+        let error =
+            parse_joplin_item("Title\n\nBody without metadata").expect_err("footer is required");
+        assert_eq!(error, ParseItemError::MissingMetadataFooter);
+    }
+
+    #[test]
     fn rejects_footer_missing_required_metadata() {
         let raw = "Title\n\nid: 0123456789abcdef0123456789abcdef\ntype_: 1\n";
         let error = parse_joplin_item(raw).expect_err("missing footer keys");
-        assert!(error.to_string().contains("missing metadata footer"));
+        assert_eq!(
+            error,
+            ParseItemError::MissingRequiredMetadataKey {
+                key: "created_time"
+            }
+        );
     }
 
     #[test]
     fn rejects_duplicated_required_footer_keys() {
         let raw = "Title\n\nid: 0123456789abcdef0123456789abcdef\nid: 0123456789abcdef0123456789abcdef\ntype_: 1\ncreated_time: 1\nupdated_time: 2\n";
         let error = parse_joplin_item(raw).expect_err("duplicate keys");
-        assert!(error.to_string().contains("missing metadata footer"));
+        assert_eq!(
+            error,
+            ParseItemError::DuplicatedMetadataKey {
+                key: "id".to_string()
+            }
+        );
     }
 
     #[test]
@@ -178,18 +240,37 @@ mod tests {
     }
 
     #[test]
+    fn handles_metadata_values_with_colons_and_empty_values() {
+        let raw = "Title\n\nBody\n\nid: 0123456789abcdef0123456789abcdef\nsource_url: https://example.test/path:with:colons\nparent_id: \ntype_: 1\ncreated_time: 1\nupdated_time: 2\n";
+        let parsed = parse_joplin_item(raw).expect("valid item");
+        assert_eq!(
+            parsed.metadata.get("source_url"),
+            Some(&"https://example.test/path:with:colons".to_string())
+        );
+        assert_eq!(parsed.metadata.get("parent_id"), Some(&String::new()));
+    }
+
+    #[test]
     fn extracts_and_deduplicates_resource_refs() {
         let refs = extract_resource_refs(
             r#"![one](:/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)
                <img src=":/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb">
+               <img src=':/cccccccccccccccccccccccccccccccc'>
                ![dupe](:/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)"#,
         );
         assert_eq!(
             refs,
             [
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+                "cccccccccccccccccccccccccccccccc".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn ignores_bare_resource_like_text() {
+        let refs = extract_resource_refs("bare :/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa text");
+        assert!(refs.is_empty());
     }
 }

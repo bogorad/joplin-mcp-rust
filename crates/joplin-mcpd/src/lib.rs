@@ -4,6 +4,8 @@ pub mod contracts;
 pub mod db;
 pub mod http;
 pub mod indexer;
+pub mod lifecycle;
 pub mod logging;
 pub mod mcp;
 pub mod observability;
+pub mod security;

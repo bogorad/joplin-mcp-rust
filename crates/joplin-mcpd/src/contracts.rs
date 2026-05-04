@@ -56,6 +56,10 @@ pub fn is_joplin_id(value: &str) -> bool {
 
 pub fn is_joplin_user_id(value: &str) -> bool {
     is_joplin_id(value)
+        || (value.len() == 22
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'))
 }
 
 #[cfg(test)]
@@ -66,9 +70,11 @@ mod tests {
     fn validates_32_char_hex_joplin_ids() {
         assert!(is_joplin_id("0123456789abcdef0123456789abcdef"));
         assert!(is_joplin_user_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert!(is_joplin_user_id("Abcdefghijklmnopqr_12-"));
         assert!(!is_joplin_id("0123456789abcdef0123456789abcde"));
         assert!(!is_joplin_id("0123456789abcdef0123456789abcdeg"));
         assert!(!is_joplin_id("0123456789abcdef0123456789abcdef00"));
+        assert!(!is_joplin_user_id("Abcdefghijklmnopqr_12!"));
     }
 
     #[test]

@@ -92,4 +92,32 @@ mod tests {
         let error = validate_token_path(&path).expect_err("broad mode rejected");
         assert!(error.to_string().contains("0600"));
     }
+
+    #[test]
+    fn rejects_broad_token_directory_permissions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let token_dir = dir.path().join("token-dir");
+        fs::create_dir_all(&token_dir).expect("create token dir");
+        fs::set_permissions(&token_dir, fs::Permissions::from_mode(0o755)).expect("chmod dir");
+        let path = token_dir.join("token");
+        fs::write(&path, "mcp_test").expect("write token");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod file");
+
+        let error = validate_token_path(&path).expect_err("broad mode rejected");
+        assert!(error.to_string().contains("0700"));
+    }
+
+    #[test]
+    fn missing_token_fails_before_serve_can_start() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let token_dir = dir.path().join("token-dir");
+        fs::create_dir_all(&token_dir).expect("create token dir");
+        fs::set_permissions(&token_dir, fs::Permissions::from_mode(0o700)).expect("chmod dir");
+        let path = token_dir.join("missing-token");
+
+        let error = read_token(&path).expect_err("missing token rejected");
+        assert!(
+            error.to_string().contains("No such file") || error.to_string().contains("not found")
+        );
+    }
 }

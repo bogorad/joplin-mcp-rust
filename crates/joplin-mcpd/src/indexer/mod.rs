@@ -1,6 +1,8 @@
+mod item_content;
 pub mod parser;
 pub mod rebuild;
 pub mod refresh;
+pub mod source;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoplinItemType {
