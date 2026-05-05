@@ -9,11 +9,11 @@ This document mirrors the project limits in `JOPLIN-MCP-RUST.md`.
 - Owner-owned items are indexed for the owner, including owner-owned items in shared folders.
 - Recipient-only shared notebook visibility is unsupported in version 1.
 - The service is LAN-only and still requires authentication for every MCP request.
-- TLS is required for LAN traffic. Plain HTTP is allowed only for localhost test mode.
+- Caddy owns TLS termination for LAN traffic. The Rust service speaks HTTP behind Caddy or local deployment wiring.
 - MCP tokens and Joplin session tokens are separate credentials.
 - Joplin passwords are accepted only for bootstrap/login and are never stored.
 - Raw MCP tokens are returned once and are never stored.
-- Audit rows are persistent MCP state. They may include event type, outcome, client label, remote IP, and sanitized metadata only.
+- Audit rows are persistent MCP state. They may include event type, outcome, client label, and sanitized metadata only.
 
 ## Module Boundaries
 

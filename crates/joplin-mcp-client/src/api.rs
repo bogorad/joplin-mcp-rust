@@ -35,7 +35,7 @@ pub struct ClientApi {
 
 impl ClientApi {
     pub fn new(config: &ClientConfig) -> anyhow::Result<Self> {
-        config.validate_fingerprint_preflight()?;
+        config.validate()?;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(config.http_timeout_seconds))
             .build()
@@ -239,7 +239,6 @@ mod tests {
             url_file: None,
             token_file: Some(PathBuf::from("/tmp/token")),
             test_id: Some("jp-mcp-test-client".to_string()),
-            server_fingerprint: None,
             http_timeout_seconds: 5,
             logging: ClientLoggingConfig::default(),
         }

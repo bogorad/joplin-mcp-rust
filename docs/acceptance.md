@@ -108,9 +108,9 @@ hashes, note bodies, full auth headers, or generated configs containing them.
 | MCP Streamable HTTP is the primary remote transport | `cargo test --workspace`; transport tests pass. |
 | MCP Streamable HTTP v1 is stateless: `POST /mcp` only, `GET`/`DELETE` return `405` | `cargo test --workspace`; HTTP transport tests pass. |
 | Custom Bearer auth is documented as a v1 OAuth 2.1 non-goal | Manual doc review of `docs/contracts.md` or plan text. |
-| TLS is required for LAN traffic | Manual Nix/deployment config review until automated. |
+| Caddy owns TLS termination for LAN deployment | Manual Nix/deployment config review until automated. |
 | Origin policy is explicit for browser and non-browser requests | `cargo test --workspace`; Origin/Referer tests pass. |
-| Reverse-proxy IP attribution is explicit and safe by default | `cargo test --workspace`; config or HTTP tests pass. |
+| Trusted-proxy, forwarded-header, and client-IP policy are absent | `cargo test --workspace`; config or HTTP tests pass. |
 | Server indexes are stored in `joplin_mcp` schema | `cargo test --workspace`; migration/schema tests pass. |
 | `sqlx _sqlx_migrations` is the schema-version source of truth | `cargo test --workspace`; migration tests pass. |
 | External Joplin content storage fails early | `cargo test --workspace`; schema/source validation tests pass. |
@@ -138,7 +138,7 @@ These criteria remain manual unless `jmr-gyb.5.5` adds automated coverage:
 - Verify live tag filters match the Joplin UI/API.
 - Review the LLM harness config example.
 - Review custom Bearer auth as a documented OAuth 2.1 non-goal.
-- Review TLS deployment requirements for LAN traffic.
+- Review Caddy TLS termination requirements for LAN traffic.
 
 Manual evidence must avoid secret values, DSNs, passwords, raw MCP tokens, token
 hashes, note bodies, full auth headers, and generated configs containing them.

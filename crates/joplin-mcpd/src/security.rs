@@ -1,7 +1,7 @@
-use crate::config::{ServerConfig, TlsMode};
+use crate::config::ServerConfig;
 use anyhow::bail;
 use axum::http::{HeaderMap, Method, StatusCode, header};
-use std::{fmt, net::SocketAddr};
+use std::fmt;
 use url::Url;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,17 +41,7 @@ impl fmt::Display for OriginPolicyError {
     }
 }
 
-pub fn validate_transport_policy(config: &ServerConfig) -> anyhow::Result<()> {
-    if config.tls_mode == TlsMode::Disabled
-        && !(config.allow_insecure_localhost && is_localhost_listener(config.listen))
-    {
-        bail!("TLS is required for non-localhost listeners");
-    }
-
-    if config.allow_insecure_localhost && !is_localhost_listener(config.listen) {
-        bail!("allow_insecure_localhost requires a localhost listener");
-    }
-
+pub fn validate_server_policy(config: &ServerConfig) -> anyhow::Result<()> {
     if config.allowed_origins.is_empty() {
         bail!("server.allowed_origins must not be empty");
     }
@@ -63,10 +53,6 @@ pub fn validate_transport_policy(config: &ServerConfig) -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-pub fn is_localhost_listener(listen: SocketAddr) -> bool {
-    listen.ip().is_loopback()
 }
 
 pub fn endpoint_class(method: &Method, path: &str) -> Option<EndpointClass> {
@@ -231,21 +217,6 @@ mod tests {
             HeaderValue::from_static("application/json; charset=utf-8"),
         );
         headers
-    }
-
-    #[test]
-    fn tls_disabled_is_accepted_only_for_insecure_localhost() {
-        let mut config = ServerConfig::default();
-        validate_transport_policy(&config).expect("localhost plaintext is accepted");
-
-        config.listen = "192.168.1.20:8081".parse().expect("listen");
-        let error = validate_transport_policy(&config).expect_err("LAN plaintext rejected");
-        assert!(error.to_string().contains("TLS is required"));
-
-        config.listen = "127.0.0.1:8081".parse().expect("listen");
-        config.allow_insecure_localhost = false;
-        let error = validate_transport_policy(&config).expect_err("localhost flag required");
-        assert!(error.to_string().contains("TLS is required"));
     }
 
     #[test]

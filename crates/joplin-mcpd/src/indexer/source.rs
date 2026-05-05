@@ -1,3 +1,4 @@
+use crate::indexer::item_content::parse_index_item;
 use crate::{db::pool as db_pool, indexer::JoplinItemType};
 use anyhow::Context;
 use async_trait::async_trait;
@@ -90,6 +91,25 @@ const ACTIVE_ITEM_REFS_QUERY: &str = r#"
     ORDER BY jop_id ASC
 "#;
 
+const ACTIVE_NOTE_TAG_REFS_QUERY: &str = r#"
+    SELECT
+        id,
+        owner_id,
+        content,
+        name,
+        mime_type,
+        updated_time,
+        created_time,
+        jop_id,
+        jop_parent_id,
+        jop_type,
+        jop_encryption_applied
+    FROM items
+    WHERE owner_id = $1
+      AND jop_type = 6
+    ORDER BY jop_id ASC
+"#;
+
 const SOURCE_WATERMARKS_QUERY: &str = r#"
     SELECT owner_id, max(updated_time) AS source_watermark
     FROM items
@@ -136,6 +156,12 @@ pub struct JoplinItemRef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoplinNoteTagRef {
+    pub note_joplin_id: String,
+    pub tag_joplin_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JoplinSourceWatermark {
     pub owner_id: String,
     pub source_watermark: i64,
@@ -172,6 +198,14 @@ pub trait JoplinSource: Send + Sync {
     async fn item_by_id(&self, user_id: &str, item_id: &str) -> anyhow::Result<Option<JoplinItem>>;
 
     async fn active_item_refs(&self, user_id: &str) -> anyhow::Result<Option<Vec<JoplinItemRef>>> {
+        let _ = user_id;
+        Ok(None)
+    }
+
+    async fn active_note_tag_refs(
+        &self,
+        user_id: &str,
+    ) -> anyhow::Result<Option<Vec<JoplinNoteTagRef>>> {
         let _ = user_id;
         Ok(None)
     }
@@ -274,6 +308,29 @@ impl JoplinSource for JoplinDbSource {
             .map(Some)
     }
 
+    async fn active_note_tag_refs(
+        &self,
+        user_id: &str,
+    ) -> anyhow::Result<Option<Vec<JoplinNoteTagRef>>> {
+        let mut conn = db_pool::acquire_indexer(&self.pool).await?;
+
+        let rows = sqlx::query_as::<_, RawJoplinItem>(ACTIVE_NOTE_TAG_REFS_QUERY)
+            .bind(user_id)
+            .fetch_all(&mut *conn)
+            .await
+            .context("load active Joplin note tag references")?;
+        let mut refs = Vec::new();
+
+        for row in rows {
+            let item = JoplinItem::try_from(row)?;
+            if let Some(edge) = active_note_tag_ref(&item) {
+                refs.push(edge);
+            }
+        }
+
+        Ok(Some(refs))
+    }
+
     async fn source_watermarks(
         &self,
         user_ids: &[String],
@@ -303,6 +360,36 @@ impl JoplinSource for JoplinDbSource {
 fn item_is_after_cursor(item: &JoplinItem, cursor: &JoplinItemCursor) -> bool {
     item.updated_time > cursor.updated_time
         || (item.updated_time == cursor.updated_time && item.id.as_str() > cursor.id.as_str())
+}
+
+fn active_note_tag_ref(item: &JoplinItem) -> Option<JoplinNoteTagRef> {
+    if item.encrypted {
+        return None;
+    }
+
+    let raw = std::str::from_utf8(&item.content).ok()?;
+    let parsed = parse_index_item(item, raw)?;
+
+    Some(JoplinNoteTagRef {
+        note_joplin_id: string_metadata(&parsed, "note_id")?,
+        tag_joplin_id: string_metadata(&parsed, "tag_id")?,
+    })
+}
+
+fn string_metadata(parsed: &crate::indexer::parser::ParsedItem, key: &str) -> Option<String> {
+    parsed
+        .metadata
+        .get(key)
+        .and_then(|value| empty_to_none(value.clone()))
+}
+
+fn empty_to_none(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 #[derive(Debug, FromRow)]
@@ -395,6 +482,14 @@ mod tests {
         assert!(ACTIVE_ITEM_REFS_QUERY.contains("jop_type IN (1, 2, 5, 9)"));
         assert!(!ACTIVE_ITEM_REFS_QUERY.contains("6"));
         assert!(ACTIVE_ITEM_REFS_QUERY.contains("ORDER BY jop_id ASC"));
+    }
+
+    #[test]
+    fn active_note_tag_refs_query_loads_note_tag_items_only() {
+        assert!(ACTIVE_NOTE_TAG_REFS_QUERY.contains("owner_id = $1"));
+        assert!(ACTIVE_NOTE_TAG_REFS_QUERY.contains("jop_type = 6"));
+        assert!(ACTIVE_NOTE_TAG_REFS_QUERY.contains("content"));
+        assert!(ACTIVE_NOTE_TAG_REFS_QUERY.contains("ORDER BY jop_id ASC"));
     }
 
     #[test]

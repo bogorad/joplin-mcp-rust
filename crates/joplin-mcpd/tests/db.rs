@@ -153,6 +153,48 @@ async fn repeated_worker_refresh_updates_changed_rows_without_dangling_tag_edges
 
 #[tokio::test]
 #[ignore = "requires disposable local Postgres from tests/compose.local.yaml"]
+async fn incremental_reconciliation_removes_hard_deleted_note_tag_edges() -> anyhow::Result<()> {
+    let dbs = TestDatabases::create("edge_reconcile").await?;
+    let (joplin_pool, mcp_pool) = dbs.connect().await?;
+    prepare_joplin_source(&joplin_pool).await?;
+    migrations::run(&mcp_pool).await?;
+
+    let user_id = insert_mcp_user(&mcp_pool, "joplin-user-a").await?;
+    insert_joplin_item(
+        &joplin_pool,
+        SourceItem::note("joplin-user-a", "note-a", "Initial body", 10),
+    )
+    .await?;
+    insert_joplin_item(
+        &joplin_pool,
+        SourceItem::tag("joplin-user-a", "tag-a", "Tag A", 11),
+    )
+    .await?;
+    insert_joplin_item(
+        &joplin_pool,
+        SourceItem::note_tag("joplin-user-a", "edge-a", "note-a", "tag-a", 12),
+    )
+    .await?;
+
+    let source = JoplinDbSource::new(joplin_pool.clone());
+    let config = immediate_refresh_config();
+    run_index_refresh_cycle(&mcp_pool, &source, &config).await;
+    assert_note_tag_edge_count(&mcp_pool, user_id, "note-a", "tag-a", 1).await?;
+
+    delete_joplin_item(&joplin_pool, "joplin-user-a", "edge-a", 6).await?;
+    force_user_hard_delete_reconciliation_due(&mcp_pool, user_id, &config).await?;
+    run_index_refresh_cycle(&mcp_pool, &source, &config).await;
+
+    assert_note_tag_edge_count(&mcp_pool, user_id, "note-a", "tag-a", 0).await?;
+    assert_no_dangling_tag_edges(&mcp_pool, user_id).await?;
+
+    joplin_pool.close().await;
+    mcp_pool.close().await;
+    dbs.drop().await
+}
+
+#[tokio::test]
+#[ignore = "requires disposable local Postgres from tests/compose.local.yaml"]
 async fn repeated_worker_refresh_marks_no_change_checked_without_rewriting_rows()
 -> anyhow::Result<()> {
     let dbs = TestDatabases::create("nochange").await?;
@@ -521,6 +563,29 @@ async fn update_joplin_note_body(
     Ok(())
 }
 
+async fn delete_joplin_item(
+    pool: &PgPool,
+    owner_id: &str,
+    joplin_id: &str,
+    item_type: i32,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        DELETE FROM items
+        WHERE owner_id = $1
+          AND jop_id = $2
+          AND jop_type = $3
+        "#,
+    )
+    .bind(owner_id)
+    .bind(joplin_id)
+    .bind(item_type)
+    .execute(pool)
+    .await
+    .context("hard-delete disposable Joplin item")?;
+    Ok(())
+}
+
 async fn force_user_due(pool: &PgPool, user_id: Uuid) -> anyhow::Result<DateTime<Utc>> {
     let old_checked_at = Utc::now() - chrono::Duration::minutes(5);
     sqlx::query("UPDATE joplin_mcp.index_state SET last_checked_at = $2 WHERE user_id = $1")
@@ -530,6 +595,31 @@ async fn force_user_due(pool: &PgPool, user_id: Uuid) -> anyhow::Result<DateTime
         .await
         .context("force disposable user refresh due")?;
     Ok(old_checked_at)
+}
+
+async fn force_user_hard_delete_reconciliation_due(
+    pool: &PgPool,
+    user_id: Uuid,
+    config: &IndexConfig,
+) -> anyhow::Result<()> {
+    let old_checked_at = Utc::now() - chrono::Duration::minutes(5);
+    let old_reconciled_at = Utc::now()
+        - chrono::Duration::hours(config.hard_delete_reconcile_interval_hours as i64 + 1);
+    sqlx::query(
+        r#"
+        UPDATE joplin_mcp.index_state
+        SET last_checked_at = $2,
+            last_reconciled_at = $3
+        WHERE user_id = $1
+        "#,
+    )
+    .bind(user_id)
+    .bind(old_checked_at)
+    .bind(old_reconciled_at)
+    .execute(pool)
+    .await
+    .context("force disposable user hard-delete reconciliation due")?;
+    Ok(())
 }
 
 async fn index_state(pool: &PgPool, user_id: Uuid) -> anyhow::Result<IndexStateRow> {
@@ -576,6 +666,31 @@ async fn assert_note_body(
     .await
     .context("read disposable note body")?;
     ensure_eq(body, expected.to_string(), "indexed note body")
+}
+
+async fn assert_note_tag_edge_count(
+    pool: &PgPool,
+    user_id: Uuid,
+    note_joplin_id: &str,
+    tag_joplin_id: &str,
+    expected: i64,
+) -> anyhow::Result<()> {
+    let count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT count(*)
+        FROM joplin_mcp.note_tags_index
+        WHERE user_id = $1
+          AND note_joplin_id = $2
+          AND tag_joplin_id = $3
+        "#,
+    )
+    .bind(user_id)
+    .bind(note_joplin_id)
+    .bind(tag_joplin_id)
+    .fetch_one(pool)
+    .await
+    .context("count disposable note tag edge")?;
+    ensure_eq(count, expected, "note tag edge count")
 }
 
 async fn assert_no_dangling_tag_edges(pool: &PgPool, user_id: Uuid) -> anyhow::Result<()> {

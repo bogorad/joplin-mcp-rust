@@ -47,7 +47,6 @@ pub struct AuditRecord {
     pub event_type: AuditEventType,
     pub outcome: AuditOutcome,
     pub client_label: Option<String>,
-    pub remote_ip: Option<String>,
     pub metadata: Value,
 }
 
@@ -58,7 +57,6 @@ impl AuditRecord {
             event_type,
             outcome,
             client_label: None,
-            remote_ip: None,
             metadata: Value::Object(Map::new()),
         }
     }
@@ -70,11 +68,6 @@ impl AuditRecord {
 
     pub fn client_label(mut self, client_label: impl Into<String>) -> Self {
         self.client_label = Some(client_label.into());
-        self
-    }
-
-    pub fn remote_ip(mut self, remote_ip: Option<String>) -> Self {
-        self.remote_ip = remote_ip;
         self
     }
 
@@ -95,10 +88,9 @@ pub async fn write_audit_log(pool: &PgPool, record: AuditRecord) -> anyhow::Resu
             event_type,
             outcome,
             client_label,
-            remote_ip,
             metadata
         )
-        VALUES ($1, $2, $3, $4, $5, CAST($6 AS inet), $7)
+        VALUES ($1, $2, $3, $4, $5, $6)
         "#,
     )
     .bind(Uuid::new_v4())
@@ -106,7 +98,6 @@ pub async fn write_audit_log(pool: &PgPool, record: AuditRecord) -> anyhow::Resu
     .bind(record.event_type.as_str())
     .bind(record.outcome.as_str())
     .bind(record.client_label.as_deref())
-    .bind(record.remote_ip.as_deref())
     .bind(record.metadata)
     .execute(&mut *conn)
     .await?;

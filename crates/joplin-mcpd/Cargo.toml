@@ -22,7 +22,6 @@ chrono.workspace = true
 clap.workspace = true
 hmac.workspace = true
 http.workspace = true
-ipnet.workspace = true
 once_cell.workspace = true
 opentelemetry.workspace = true
 opentelemetry-appender-tracing.workspace = true

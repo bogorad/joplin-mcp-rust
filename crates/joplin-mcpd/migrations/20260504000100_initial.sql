@@ -18,12 +18,10 @@ CREATE TABLE IF NOT EXISTS joplin_mcp.mcp_tokens (
   label text NOT NULL,
   scope text NOT NULL DEFAULT 'read',
   created_at timestamptz NOT NULL DEFAULT now(),
-  created_from_ip inet,
   last_seen_at timestamptz,
   revoked_at timestamptz,
   revoked_by uuid,
   revoke_reason text,
-  revoked_from_ip inet,
   expires_at timestamptz
 );
 
@@ -36,7 +34,6 @@ CREATE TABLE IF NOT EXISTS joplin_mcp.audit_log (
   event_type text NOT NULL,
   outcome text NOT NULL,
   client_label text,
-  remote_ip inet,
   metadata jsonb NOT NULL DEFAULT '{}',
   created_at timestamptz NOT NULL DEFAULT now()
 );

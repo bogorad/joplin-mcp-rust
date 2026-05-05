@@ -62,7 +62,6 @@ pub struct TokenInsert {
     pub token_hash: TokenHash,
     pub label: String,
     pub scope: String,
-    pub created_from_ip: Option<String>,
     pub expires_at: Option<DateTime<Utc>>,
 }
 
@@ -129,10 +128,9 @@ impl TokenRepository {
                 hmac_key_id,
                 label,
                 scope,
-                created_from_ip,
                 expires_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, CAST($7 AS inet), $8)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             "#,
         )
         .bind(token.id)
@@ -141,7 +139,6 @@ impl TokenRepository {
         .bind(&token.token_hash.hmac_key_id)
         .bind(&token.label)
         .bind(&token.scope)
-        .bind(token.created_from_ip.as_deref())
         .bind(token.expires_at)
         .execute(&mut *conn)
         .await?;
@@ -156,10 +153,8 @@ impl TokenRepository {
         label: impl Into<String>,
         scope: impl Into<String>,
         expires_at: Option<DateTime<Utc>>,
-        created_from_ip: Option<String>,
     ) -> anyhow::Result<GeneratedToken> {
-        let generated =
-            generate_token_for_insert(user_id, key, label, scope, expires_at, created_from_ip);
+        let generated = generate_token_for_insert(user_id, key, label, scope, expires_at);
         self.insert_generated_token(&generated.insert).await?;
         Ok(generated)
     }
@@ -255,7 +250,6 @@ impl TokenRepository {
         token_id: Uuid,
         revoked_by: Option<Uuid>,
         reason: Option<&str>,
-        revoked_from_ip: Option<&str>,
     ) -> anyhow::Result<bool> {
         let mut conn = db_pool::acquire_runtime(&self.pool).await?;
 
@@ -265,15 +259,13 @@ impl TokenRepository {
             SET
                 revoked_at = COALESCE(revoked_at, now()),
                 revoked_by = COALESCE(revoked_by, $2),
-                revoke_reason = COALESCE(revoke_reason, $3),
-                revoked_from_ip = COALESCE(revoked_from_ip, CAST($4 AS inet))
+                revoke_reason = COALESCE(revoke_reason, $3)
             WHERE id = $1 AND revoked_at IS NULL
             "#,
         )
         .bind(token_id)
         .bind(revoked_by)
         .bind(reason)
-        .bind(revoked_from_ip)
         .execute(&mut *conn)
         .await?;
 
@@ -371,7 +363,6 @@ pub fn generate_token_for_insert(
     label: impl Into<String>,
     scope: impl Into<String>,
     expires_at: Option<DateTime<Utc>>,
-    created_from_ip: Option<String>,
 ) -> GeneratedToken {
     let raw_token = generate_raw_token();
     let token_hash = token_hash(&key.id, &key.bytes, &raw_token).expect("validated HMAC key");
@@ -384,7 +375,6 @@ pub fn generate_token_for_insert(
             token_hash,
             label: label.into(),
             scope: scope.into(),
-            created_from_ip,
             expires_at,
         },
     }
@@ -629,7 +619,6 @@ mod tests {
             "workstation",
             "read",
             Some(Utc::now() + Duration::days(90)),
-            None,
         );
 
         assert!(validate_raw_token(&generated.raw_token));
@@ -655,7 +644,7 @@ mod tests {
             let now = Utc::now();
 
             let first = repository
-                .create_token(user_id, &first_key, "first-key", "read", None, None)
+                .create_token(user_id, &first_key, "first-key", "read", None)
                 .await?;
             let first_header = format!("Bearer {}", first.raw_token);
             let first_record = repository
@@ -665,7 +654,7 @@ mod tests {
             assert_eq!(first_record.id, first.insert.id);
 
             let later = repository
-                .create_token(user_id, &second_key, "later-key", "read", None, None)
+                .create_token(user_id, &second_key, "later-key", "read", None)
                 .await?;
             let later_header = format!("Bearer {}", later.raw_token);
             let later_record = repository
@@ -675,12 +664,12 @@ mod tests {
             assert_eq!(later_record.id, later.insert.id);
 
             let revoked = repository
-                .create_token(user_id, &second_key, "revoked", "read", None, None)
+                .create_token(user_id, &second_key, "revoked", "read", None)
                 .await?;
             let revoked_header = format!("Bearer {}", revoked.raw_token);
             assert!(
                 repository
-                    .revoke_token(revoked.insert.id, None, Some("test"), None)
+                    .revoke_token(revoked.insert.id, None, Some("test"))
                     .await?
             );
             assert_eq!(

@@ -1,20 +1,14 @@
-use crate::config::ServerConfig;
 use axum::{
-    http::{HeaderMap, HeaderValue, StatusCode},
+    http::StatusCode,
     response::{IntoResponse, Response},
 };
-use ipnet::IpNet;
 use serde::Serialize;
 use std::{
     future::Future,
-    net::{IpAddr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::sync::{Notify, RwLock};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RemoteIp(pub IpAddr);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -94,37 +88,9 @@ pub fn should_log_slow_request(started: Instant, threshold: Duration) -> bool {
     started.elapsed() >= threshold
 }
 
-pub fn extract_client_ip(
-    peer: SocketAddr,
-    headers: &HeaderMap,
-    config: &ServerConfig,
-) -> Result<IpAddr, StatusCode> {
-    if !ip_in_nets(peer.ip(), &config.trusted_proxies) {
-        return Ok(peer.ip());
-    }
-
-    let Some(value) = headers.get(config.forwarded_header.as_str()) else {
-        return Ok(peer.ip());
-    };
-
-    parse_forwarded_ip(value).ok_or(StatusCode::BAD_REQUEST)
-}
-
-fn parse_forwarded_ip(value: &HeaderValue) -> Option<IpAddr> {
-    let value = value.to_str().ok()?;
-    let first = value.split(',').next()?.trim();
-    first.parse().ok()
-}
-
-fn ip_in_nets(ip: IpAddr, nets: &[IpNet]) -> bool {
-    nets.iter().any(|net| net.contains(&ip))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ServerConfig;
-    use axum::http::HeaderMap;
     use std::time::Duration;
 
     #[tokio::test]
@@ -143,51 +109,6 @@ mod tests {
         drain.begin().await;
 
         assert_eq!(readiness.status().await, ReadinessStatus::ShuttingDown);
-    }
-
-    #[test]
-    fn ignores_forwarded_header_without_trusted_proxy() {
-        let config = ServerConfig::default();
-        let peer: SocketAddr = "192.0.2.10:1234".parse().expect("peer");
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", "198.51.100.1".parse().expect("header"));
-
-        let ip = extract_client_ip(peer, &headers, &config).expect("client ip");
-
-        assert_eq!(ip, peer.ip());
-    }
-
-    #[test]
-    fn accepts_forwarded_header_from_trusted_proxy() {
-        let config = ServerConfig {
-            trusted_proxies: vec!["192.0.2.0/24".parse().expect("net")],
-            ..ServerConfig::default()
-        };
-        let peer: SocketAddr = "192.0.2.10:1234".parse().expect("peer");
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-forwarded-for",
-            "198.51.100.1, 203.0.113.2".parse().expect("header"),
-        );
-
-        let ip = extract_client_ip(peer, &headers, &config).expect("client ip");
-
-        assert_eq!(ip, "198.51.100.1".parse::<IpAddr>().expect("ip"));
-    }
-
-    #[test]
-    fn rejects_malformed_forwarded_header_from_trusted_proxy() {
-        let config = ServerConfig {
-            trusted_proxies: vec!["192.0.2.0/24".parse().expect("net")],
-            ..ServerConfig::default()
-        };
-        let peer: SocketAddr = "192.0.2.10:1234".parse().expect("peer");
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", "not-an-ip".parse().expect("header"));
-
-        let status = extract_client_ip(peer, &headers, &config).expect_err("bad header");
-
-        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[test]

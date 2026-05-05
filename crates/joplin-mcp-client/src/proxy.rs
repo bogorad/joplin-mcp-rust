@@ -3,6 +3,8 @@ use anyhow::{Context, bail};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
+const MAX_STDIO_FRAME_BYTES: usize = 100 * 1024 * 1024;
+
 pub async fn serve_stdio_proxy(config: ClientConfig) -> anyhow::Result<()> {
     let token = config.read_token()?;
     let api = ClientApi::new(&config)?;
@@ -59,6 +61,11 @@ where
     let Some(content_length) = content_length else {
         bail!("stdio frame missing Content-Length");
     };
+    if content_length > MAX_STDIO_FRAME_BYTES {
+        bail!(
+            "stdio frame Content-Length {content_length} exceeds maximum {MAX_STDIO_FRAME_BYTES}"
+        );
+    }
     let mut body = vec![0_u8; content_length];
     tokio::io::AsyncReadExt::read_exact(input, &mut body).await?;
     Ok(Some(body))
@@ -100,5 +107,17 @@ mod tests {
                 .expect("utf8")
                 .starts_with("Content-Length: 36\r\n\r\n")
         );
+    }
+
+    #[tokio::test]
+    async fn oversized_stdio_frame_is_rejected_before_body_read() {
+        let input = format!("Content-Length: {}\r\n\r\n", MAX_STDIO_FRAME_BYTES + 1);
+        let mut reader = BufReader::new(input.as_bytes());
+
+        let error = read_frame(&mut reader)
+            .await
+            .expect_err("oversized frame is rejected");
+
+        assert!(error.to_string().contains("exceeds maximum"));
     }
 }

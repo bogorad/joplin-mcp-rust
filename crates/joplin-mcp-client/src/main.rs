@@ -100,7 +100,6 @@ mod tests {
             "--url-file",
             "--client-label",
             "--test-id",
-            "--server-fingerprint",
             "--http-timeout-seconds",
         ] {
             assert!(help.contains(required), "missing help entry {required}");

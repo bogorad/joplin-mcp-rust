@@ -1610,7 +1610,7 @@ WITH changes AS (
     FROM joplin_mcp.notes_index notes
     WHERE notes.user_id = $1
         AND notes.deleted_time IS NULL
-        AND notes.updated_time > $2
+        AND notes.updated_time >= $2
     UNION ALL
     SELECT
         deleted.joplin_id,
@@ -1629,7 +1629,7 @@ WITH changes AS (
         AND COALESCE(
             deleted.deleted_time,
             floor(extract(epoch from deleted.tombstoned_at) * 1000)::bigint
-        ) > $2
+        ) >= $2
 )
 SELECT
     joplin_id,
@@ -2563,6 +2563,14 @@ mod tests {
         assert!(CHANGES_SINCE_QUERY.contains("true AS deleted"));
         assert!(CHANGES_SINCE_QUERY.contains("deleted.deleted_time"));
         assert!(CHANGES_SINCE_QUERY.contains("deleted.tombstoned_at"));
+    }
+
+    #[test]
+    fn get_changes_since_query_rechecks_since_boundary_and_keysets_after_cursor() {
+        assert_eq!(CHANGES_SINCE_QUERY.matches(">= $2").count(), 2);
+        assert!(!CHANGES_SINCE_QUERY.contains("notes.updated_time > $2"));
+        assert!(CHANGES_SINCE_QUERY.contains("updated_time > $3"));
+        assert!(CHANGES_SINCE_QUERY.contains("updated_time = $3 AND joplin_id > $4"));
     }
 
     #[test]

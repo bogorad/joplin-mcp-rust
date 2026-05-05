@@ -9,7 +9,7 @@ resolver = "3"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.90"
-version = "0.1.24"
+version = "0.1.25"
 
 [workspace.dependencies]
 anyhow = "1.0.100"
@@ -20,7 +20,6 @@ chrono = { version = "0.4.42", features = ["clock", "serde"] }
 clap = { version = "4.5.51", features = ["derive", "env"] }
 hmac = "0.12.1"
 http = "1.3.1"
-ipnet = { version = "2.11.0", features = ["serde"] }
 once_cell = "1.21.3"
 opentelemetry = { version = "0.31.0", features = ["logs"] }
 opentelemetry-appender-tracing = "0.31.1"

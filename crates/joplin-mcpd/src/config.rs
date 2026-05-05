@@ -1,5 +1,4 @@
 use anyhow::{Context, bail};
-use ipnet::IpNet;
 use serde::Deserialize;
 use std::{fs, net::SocketAddr, path::Path};
 use url::Url;
@@ -40,7 +39,7 @@ impl Config {
         if self.mcp.protocol_version != crate::contracts::MCP_PROTOCOL_VERSION {
             bail!("mcp.protocol_version must be 2025-06-18");
         }
-        crate::security::validate_transport_policy(&self.server)?;
+        crate::security::validate_server_policy(&self.server)?;
         if self.server.request_timeout_seconds == 0
             || self.server.slow_request_log_threshold_ms == 0
             || self.server.shutdown_grace_seconds == 0
@@ -71,9 +70,6 @@ impl Config {
         if self.mcp.tool_timeout_seconds == 0 {
             bail!("mcp.tool_timeout_seconds must be greater than zero");
         }
-        if self.bootstrap_rate_limit.per_ip_per_minute == 0 {
-            bail!("bootstrap_rate_limit.per_ip_per_minute must be greater than zero");
-        }
         if self.bootstrap_rate_limit.per_email_per_hour == 0 {
             bail!("bootstrap_rate_limit.per_email_per_hour must be greater than zero");
         }
@@ -98,12 +94,7 @@ impl Config {
 pub struct ServerConfig {
     pub listen: SocketAddr,
     pub public_base_url: Url,
-    pub lan_cidrs: Vec<IpNet>,
-    pub tls_mode: TlsMode,
     pub allowed_origins: Vec<String>,
-    pub allow_insecure_localhost: bool,
-    pub trusted_proxies: Vec<IpNet>,
-    pub forwarded_header: String,
     pub request_timeout_seconds: u64,
     pub slow_request_log_threshold_ms: u64,
     pub shutdown_grace_seconds: u64,
@@ -114,24 +105,12 @@ impl Default for ServerConfig {
         Self {
             listen: "127.0.0.1:8081".parse().expect("valid listen address"),
             public_base_url: Url::parse("http://127.0.0.1:8081").expect("valid url"),
-            lan_cidrs: Vec::new(),
-            tls_mode: TlsMode::Disabled,
             allowed_origins: vec!["http://127.0.0.1:8081".to_string()],
-            allow_insecure_localhost: true,
-            trusted_proxies: Vec::new(),
-            forwarded_header: "x-forwarded-for".to_string(),
             request_timeout_seconds: 5,
             slow_request_log_threshold_ms: 500,
             shutdown_grace_seconds: 5,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TlsMode {
-    Required,
-    Disabled,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -254,14 +233,12 @@ pub struct HmacKeyConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BootstrapRateLimitConfig {
-    pub per_ip_per_minute: u32,
     pub per_email_per_hour: u32,
 }
 
 impl Default for BootstrapRateLimitConfig {
     fn default() -> Self {
         Self {
-            per_ip_per_minute: 5,
             per_email_per_hour: 20,
         }
     }
@@ -370,15 +347,6 @@ mod tests {
     fn valid_config_validates_for_localhost_test_mode() {
         let (_dir, config) = valid_config();
         config.validate().expect("valid config validates");
-    }
-
-    #[test]
-    fn rejects_non_localhost_without_tls() {
-        let (_dir, mut config) = valid_config();
-        config.server.listen = "0.0.0.0:8081".parse().expect("valid address");
-        config.server.allow_insecure_localhost = false;
-        let error = config.validate().expect_err("config is rejected");
-        assert!(error.to_string().contains("TLS is required"));
     }
 
     #[test]

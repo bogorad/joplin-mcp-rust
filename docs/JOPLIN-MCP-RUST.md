@@ -61,8 +61,10 @@ The MCP server must be reachable only from the LAN or a narrower allow-list. Do
 not expose it publicly. Do not put it behind a public reverse proxy route.
 
 LAN-only is a reachability limit, not the whole security model. The service MUST
-still use TLS for non-localhost traffic, validate request origins for browser
-reachable endpoints, and require authentication on every MCP request.
+still validate request origins for browser reachable endpoints and require
+authentication on every MCP request. Caddy owns TLS termination for LAN
+deployment; `joplin-mcpd` itself speaks HTTP behind Caddy and does not use
+proxy-derived caller identity or address-based policy.
 
 ### Non-Goals
 
@@ -315,7 +317,6 @@ Options:
 --url-file ${XDG_RUNTIME_DIR}/joplin-mcp-client/url
 --client-label chuck-laptop-codex
 --test-id <uuid>
---server-fingerprint sha256:<base64>
 ```
 
 Behavior:
@@ -469,12 +470,7 @@ Example:
 [server]
 listen = "0.0.0.0:8081"
 public_base_url = "https://joplin-mcp.lan"
-lan_cidrs = ["192.168.0.0/16", "10.0.0.0/8"]
-tls_mode = "required"
 allowed_origins = ["https://joplin-mcp.lan"]
-allow_insecure_localhost = false
-trusted_proxies = []
-forwarded_header = "x-forwarded-for"
 request_timeout_seconds = 30
 slow_request_log_threshold_ms = 2000
 shutdown_grace_seconds = 30
@@ -500,7 +496,6 @@ expires_after_days = 90
 allow_non_expiring_tokens = false
 
 [bootstrap_rate_limit]
-per_ip_per_minute = 5
 per_email_per_hour = 20
 
 [mcp]
@@ -533,14 +528,13 @@ Do not store per-user Joplin passwords here.
 a configuration where both DSNs target the same database or where either role is
 used for the wrong database.
 
-Reverse-proxy IP policy:
+Caller address policy:
 
 ```text
-1. If server.trusted_proxies is empty, ignore Forwarded and X-Forwarded-For.
-2. Use the socket peer address for rate limits and audit remote_ip.
-3. If trusted_proxies is non-empty, accept the configured forwarded_header only
-   when the socket peer is inside one trusted CIDR.
-4. Reject malformed forwarded IP values instead of guessing.
+1. Do not derive caller identity from proxy headers.
+2. Do not configure address-trusting proxy lists.
+3. Do not use caller address for auth, bootstrap throttling, tokens, or audit rows.
+4. Authenticate with Joplin Server during bootstrap and MCP bearer tokens after bootstrap.
 ```
 
 Version 1 is single-instance only. Running two `joplin-mcpd` processes against
@@ -679,9 +673,8 @@ not hex, base64, or newline-terminated text. Startup must reject a missing key,
 a key shorter or longer than 32 bytes, and an `active_hmac_key_id` that does not
 exist in `tokens.hmac_keys`.
 
-Bearer tokens over TLS do not need a nonce or replay window in v1. If plaintext
-localhost transport is allowed for testing, it must be bound to `127.0.0.1` and
-must not be enabled on LAN interfaces.
+Bearer tokens are credentials and do not need a nonce or replay window in v1.
+Caddy terminates TLS for LAN deployment before forwarding to `joplin-mcpd`.
 
 Database lookup by token hash avoids direct token byte comparison in the hot
 path. If any in-memory comparison of token material is introduced, use a
@@ -727,12 +720,10 @@ CREATE TABLE joplin_mcp.mcp_tokens (
   label text NOT NULL,
   scope text NOT NULL DEFAULT 'read',
   created_at timestamptz NOT NULL DEFAULT now(),
-  created_from_ip inet,
   last_seen_at timestamptz,
   revoked_at timestamptz,
   revoked_by uuid,
   revoke_reason text,
-  revoked_from_ip inet,
   expires_at timestamptz
 );
 
@@ -749,7 +740,6 @@ CREATE TABLE joplin_mcp.audit_log (
   event_type text NOT NULL,
   outcome text NOT NULL,
   client_label text,
-  remote_ip inet,
   metadata jsonb NOT NULL DEFAULT '{}',
   created_at timestamptz NOT NULL DEFAULT now()
 );
@@ -1919,9 +1909,7 @@ token HMAC key is missing
 token HMAC key is not exactly 32 raw bytes
 token HMAC key id in config is missing from key list
 another joplin-mcpd instance holds the singleton lock
-TLS is disabled for a non-localhost listener
 Origin validation is disabled for browser-reachable endpoints
-listen address is public while LAN allow-list is disabled
 ```
 
 The server may start degraded if Joplin Server auth endpoint is temporarily
@@ -1936,7 +1924,6 @@ token file permissions are broader than 0600
 token directory permissions are broader than 0700
 token check fails
 server URL is missing
-TLS fingerprint check fails when configured
 ```
 
 ## 22. Security Requirements
@@ -1963,17 +1950,9 @@ Server stores only token hashes.
 
 ### Transport Security
 
-The server MUST serve TLS for all LAN traffic. Self-signed certificates are
-acceptable only when the client pins the certificate fingerprint with
-`--server-fingerprint`.
-
-Plaintext HTTP is allowed only when:
-
-```text
-1. allow_insecure_localhost = true
-2. the server listens on 127.0.0.1 or ::1
-3. the client config is local-test only
-```
+Caddy owns TLS termination for LAN traffic. The Rust service listens on plain
+HTTP behind Caddy or local deployment wiring and does not implement certificate
+pinning, trusted-proxy parsing, forwarded-header parsing, or client-IP policy.
 
 Browser-reachable endpoints MUST validate `Origin` and reject unexpected
 origins.
@@ -2238,9 +2217,9 @@ client token is stored under XDG_RUNTIME_DIR with mode 0600
 MCP Streamable HTTP is the primary remote transport
 MCP Streamable HTTP v1 is stateless: POST /mcp only, GET/DELETE return 405
 custom Bearer auth is documented as a v1 OAuth 2.1 non-goal
-TLS is required for LAN traffic
+Caddy owns TLS termination for LAN deployment
 Origin policy is explicit for browser and non-browser requests
-reverse-proxy IP attribution is explicit and safe by default
+trusted-proxy, forwarded-header, and client-IP policy are absent
 server indexes are stored in joplin_mcp schema
 sqlx _sqlx_migrations is the schema-version source of truth
 external Joplin content storage fails early
@@ -2290,14 +2269,14 @@ startup fails early on bad DB/schema/token/logging config
 ### 0.2 - 2026-05-04
 
 - Adopted MCP Streamable HTTP as the primary remote transport.
-- Added TLS, Origin validation, XDG runtime token storage, finite token expiry,
+- Added Origin validation, XDG runtime token storage, finite token expiry,
   HMAC key rotation, bootstrap rate limits, audit logging, tag indexing, tool
   JSON Schema requirements, response-size budgets, metrics, traces, and deleted
   item behavior.
 - Clarified stateless MCP transport behavior, Joplin user_id bootstrap identity,
   sqlx schema-version gating, HMAC key format, external-storage detection,
   stale/tombstone index behavior, single-instance operation, timeouts, shutdown
-  drain, reverse-proxy IP handling, and backup boundaries.
+  drain, Caddy-owned TLS termination, and backup boundaries.
 - Split live Postgres testing and runtime access into separate Joplin and MCP
   databases with separate SOPS keys, DSNs, users, and fail-fast validation.
 - Added required build/test command contract: cargo, Nix, Justfile aliases,

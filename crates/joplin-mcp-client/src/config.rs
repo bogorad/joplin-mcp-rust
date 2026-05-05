@@ -16,8 +16,6 @@ pub struct ClientConfig {
     pub token_file: Option<PathBuf>,
     #[arg(long)]
     pub test_id: Option<String>,
-    #[arg(long)]
-    pub server_fingerprint: Option<String>,
     #[arg(long, env = "JP_MCP_HTTP_TIMEOUT_SECONDS", default_value_t = 3)]
     pub http_timeout_seconds: u64,
     #[command(flatten)]
@@ -79,12 +77,7 @@ impl ClientConfig {
         bail!("server URL is missing; set --server-url, --url-file, or JP_MCP_SERVER_URL");
     }
 
-    pub fn validate_fingerprint_preflight(&self) -> anyhow::Result<()> {
-        if self.server_fingerprint.is_some() {
-            bail!(
-                "--server-fingerprint requires TLS verification support that is not implemented yet"
-            );
-        }
+    pub fn validate(&self) -> anyhow::Result<()> {
         if self.http_timeout_seconds == 0 {
             bail!("HTTP timeout must be greater than zero");
         }
@@ -144,7 +137,6 @@ mod tests {
             url_file: None,
             token_file: Some(PathBuf::from("/tmp/custom-token")),
             test_id: None,
-            server_fingerprint: None,
             http_timeout_seconds: 5,
             logging: ClientLoggingConfig::default(),
         };
@@ -164,7 +156,6 @@ mod tests {
             url_file: Some(path),
             token_file: None,
             test_id: None,
-            server_fingerprint: None,
             http_timeout_seconds: 5,
             logging: ClientLoggingConfig::default(),
         };
@@ -182,7 +173,6 @@ mod tests {
             url_file: None,
             token_file: Some(PathBuf::from("/tmp/token")),
             test_id: None,
-            server_fingerprint: None,
             http_timeout_seconds: 5,
             logging: ClientLoggingConfig::default(),
         };
@@ -192,38 +182,17 @@ mod tests {
     }
 
     #[test]
-    fn configured_fingerprint_fails_closed_until_tls_check_exists() {
-        let config = ClientConfig {
-            server_url: Some(Url::parse("https://joplin-mcp.lan").expect("url")),
-            url_file: None,
-            token_file: Some(PathBuf::from("/tmp/token")),
-            test_id: None,
-            server_fingerprint: Some("sha256:test".to_string()),
-            http_timeout_seconds: 5,
-            logging: ClientLoggingConfig::default(),
-        };
-
-        let err = config
-            .validate_fingerprint_preflight()
-            .expect_err("fingerprint support is not silently ignored");
-        assert!(err.to_string().contains("--server-fingerprint"));
-    }
-
-    #[test]
     fn rejects_zero_http_timeout() {
         let config = ClientConfig {
             server_url: Some(Url::parse("https://joplin-mcp.lan").expect("url")),
             url_file: None,
             token_file: Some(PathBuf::from("/tmp/token")),
             test_id: None,
-            server_fingerprint: None,
             http_timeout_seconds: 0,
             logging: ClientLoggingConfig::default(),
         };
 
-        let err = config
-            .validate_fingerprint_preflight()
-            .expect_err("zero timeout is rejected");
+        let err = config.validate().expect_err("zero timeout is rejected");
         assert!(err.to_string().contains("HTTP timeout"));
     }
 }

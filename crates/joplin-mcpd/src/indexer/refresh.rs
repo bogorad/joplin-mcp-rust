@@ -4,7 +4,9 @@ use crate::indexer::JoplinItemType;
 use crate::indexer::item_content::parse_index_item;
 use crate::indexer::parser::{ParsedItem, extract_resource_refs};
 use crate::indexer::rebuild::{FullRebuildOutcome, IndexStatus, full_rebuild_user_in_transaction};
-use crate::indexer::source::{JOPLIN_ITEM_BATCH_SIZE, JoplinItem, JoplinItemCursor, JoplinSource};
+use crate::indexer::source::{
+    JOPLIN_ITEM_BATCH_SIZE, JoplinItem, JoplinItemCursor, JoplinNoteTagRef, JoplinSource,
+};
 use crate::observability::metrics;
 use anyhow::Context;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -161,6 +163,12 @@ struct DeletedRow {
 struct IndexedItemRef {
     joplin_id: String,
     item_type: i32,
+}
+
+#[derive(Debug, FromRow)]
+struct IndexedNoteTagRef {
+    note_joplin_id: String,
+    tag_joplin_id: String,
 }
 
 pub async fn due_refresh_users(
@@ -1180,36 +1188,85 @@ async fn reconcile_hard_deletes<S>(
 where
     S: JoplinSource,
 {
-    let Some(active_refs) = source.active_item_refs(&user.joplin_user_id).await? else {
+    let active_refs = source.active_item_refs(&user.joplin_user_id).await?;
+    let active_note_tag_refs = source.active_note_tag_refs(&user.joplin_user_id).await?;
+    if active_refs.is_none() && active_note_tag_refs.is_none() {
         return Ok(0);
-    };
-    let active: HashSet<(String, i32)> = active_refs
-        .into_iter()
-        .map(|item| (item.joplin_id, item.item_type as i32))
-        .collect();
-    let indexed = indexed_item_refs(tx, user.mcp_user_id).await?;
-    let mut reconciled = 0;
-
-    for item in indexed {
-        if active.contains(&(item.joplin_id.clone(), item.item_type)) {
-            continue;
-        }
-        let Some(item_type) = JoplinItemType::from_i32(item.item_type) else {
-            continue;
-        };
-        let row = DeletedRow {
-            joplin_id: item.joplin_id,
-            item_type,
-            updated_time: 0,
-            deleted_time: None,
-            note_joplin_id: None,
-            tag_joplin_id: None,
-        };
-        purge_active_row(tx, user.mcp_user_id, &row).await?;
-        upsert_deleted_row(tx, user.mcp_user_id, &row, "reconciliation").await?;
-        reconciled += 1;
     }
 
+    let mut reconciled = 0;
+
+    if let Some(active_refs) = active_refs {
+        let active: HashSet<(String, i32)> = active_refs
+            .into_iter()
+            .map(|item| (item.joplin_id, item.item_type as i32))
+            .collect();
+        let indexed = indexed_item_refs(tx, user.mcp_user_id).await?;
+
+        for item in indexed {
+            if active.contains(&(item.joplin_id.clone(), item.item_type)) {
+                continue;
+            }
+            let Some(item_type) = JoplinItemType::from_i32(item.item_type) else {
+                continue;
+            };
+            let row = DeletedRow {
+                joplin_id: item.joplin_id,
+                item_type,
+                updated_time: 0,
+                deleted_time: None,
+                note_joplin_id: None,
+                tag_joplin_id: None,
+            };
+            purge_active_row(tx, user.mcp_user_id, &row).await?;
+            upsert_deleted_row(tx, user.mcp_user_id, &row, "reconciliation").await?;
+            reconciled += 1;
+        }
+    }
+
+    if let Some(active_note_tag_refs) = active_note_tag_refs {
+        reconciled +=
+            reconcile_note_tag_hard_deletes(tx, user.mcp_user_id, active_note_tag_refs).await?;
+    }
+
+    Ok(reconciled)
+}
+
+async fn reconcile_note_tag_hard_deletes(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+    active_refs: Vec<JoplinNoteTagRef>,
+) -> anyhow::Result<usize> {
+    let active: HashSet<(String, String)> = active_refs
+        .into_iter()
+        .map(|edge| (edge.note_joplin_id, edge.tag_joplin_id))
+        .collect();
+    let indexed = indexed_note_tag_refs(tx, user_id).await?;
+    let mut reconciled = 0;
+
+    for edge in indexed {
+        if active.contains(&(edge.note_joplin_id.clone(), edge.tag_joplin_id.clone())) {
+            continue;
+        }
+
+        let result = sqlx::query(
+            r#"
+            DELETE FROM joplin_mcp.note_tags_index
+            WHERE user_id = $1
+              AND note_joplin_id = $2
+              AND tag_joplin_id = $3
+            "#,
+        )
+        .bind(user_id)
+        .bind(&edge.note_joplin_id)
+        .bind(&edge.tag_joplin_id)
+        .execute(tx.as_mut())
+        .await
+        .context("purge hard-deleted note tag edge")?;
+        reconciled += result.rows_affected() as usize;
+    }
+
+    reconciled += prune_dangling_note_tag_edges(tx, user_id).await?;
     Ok(reconciled)
 }
 
@@ -1235,6 +1292,56 @@ async fn indexed_item_refs(
     .fetch_all(tx.as_mut())
     .await
     .context("load indexed item references")
+}
+
+async fn indexed_note_tag_refs(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+) -> anyhow::Result<Vec<IndexedNoteTagRef>> {
+    sqlx::query_as::<_, IndexedNoteTagRef>(
+        r#"
+        SELECT note_joplin_id, tag_joplin_id
+        FROM joplin_mcp.note_tags_index
+        WHERE user_id = $1
+        ORDER BY note_joplin_id ASC, tag_joplin_id ASC
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(tx.as_mut())
+    .await
+    .context("load indexed note tag references")
+}
+
+async fn prune_dangling_note_tag_edges(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+) -> anyhow::Result<usize> {
+    let result = sqlx::query(
+        r#"
+        DELETE FROM joplin_mcp.note_tags_index edges
+        WHERE edges.user_id = $1
+          AND (
+            NOT EXISTS (
+              SELECT 1
+              FROM joplin_mcp.notes_index notes
+              WHERE notes.user_id = edges.user_id
+                AND notes.joplin_id = edges.note_joplin_id
+            )
+            OR NOT EXISTS (
+              SELECT 1
+              FROM joplin_mcp.tags_index tags
+              WHERE tags.user_id = edges.user_id
+                AND tags.joplin_id = edges.tag_joplin_id
+            )
+          )
+        "#,
+    )
+    .bind(user_id)
+    .execute(tx.as_mut())
+    .await
+    .context("prune dangling note tag edges")?;
+
+    Ok(result.rows_affected() as usize)
 }
 
 pub fn requires_full_rebuild(gap_seconds: u64, lookback_cap_seconds: u64) -> bool {

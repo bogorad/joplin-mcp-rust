@@ -99,7 +99,7 @@
         packages = rec {
           joplin-mcpd = pkgs.rustPlatform.buildRustPackage {
             pname = "joplin-mcpd";
-            version = "0.1.24";
+            version = "0.1.25";
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
             buildAndTestSubdir = "crates/joplin-mcpd";
@@ -109,7 +109,7 @@
 
           joplin-mcp-client = pkgs.rustPlatform.buildRustPackage {
             pname = "joplin-mcp-client";
-            version = "0.1.24";
+            version = "0.1.25";
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
             buildAndTestSubdir = "crates/joplin-mcp-client";

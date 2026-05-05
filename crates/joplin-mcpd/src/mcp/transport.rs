@@ -1,5 +1,8 @@
 use crate::{
-    auth::tokens::{HmacKey, TokenAuthError, TokenRecord, TokenRepository, parse_bearer_token},
+    auth::tokens::{
+        DEFAULT_LAST_SEEN_UPDATE_INTERVAL, HmacKey, TokenAuthError, TokenRecord, TokenRepository,
+        parse_bearer_token,
+    },
     contracts::MCP_PROTOCOL_VERSION,
     http::{ApiBackend, AppState},
     lifecycle::ReadinessStatus,
@@ -53,9 +56,22 @@ impl McpAuth {
                 repository,
                 hmac_keys,
             } => {
+                let now = Utc::now();
                 let token = repository
-                    .authenticate_bearer(authorization, hmac_keys, Utc::now())
+                    .authenticate_bearer(authorization, hmac_keys, now)
                     .await?;
+                if let Err(error) = repository
+                    .touch_last_seen_if_stale(token.id, now, DEFAULT_LAST_SEEN_UPDATE_INTERVAL)
+                    .await
+                {
+                    tracing::warn!(
+                        operation = "token_last_seen_update",
+                        token_id = %token.id,
+                        user_id = %token.user_id,
+                        error = %error,
+                        "failed to update MCP token last_seen_at"
+                    );
+                }
                 Ok(Some(token))
             }
         }
@@ -369,7 +385,16 @@ fn has_json_content_type(headers: &HeaderMap) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::migrations;
+    use anyhow::Context;
     use axum::http::{HeaderMap, HeaderValue};
+    use chrono::{DateTime, Utc};
+    use sqlx::{
+        PgPool,
+        postgres::{PgConnectOptions, PgPoolOptions},
+    };
+    use std::sync::Arc;
+    use uuid::Uuid;
 
     #[test]
     fn protocol_version_is_required_after_initialize() {
@@ -457,5 +482,152 @@ mod tests {
             HeaderValue::from_static("text/event-stream"),
         );
         assert!(!accepts_json(&headers));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable local Postgres from tests/compose.local.yaml"]
+    async fn repository_auth_updates_last_seen_once_per_interval() -> anyhow::Result<()> {
+        let (database, pool) = TransportTestDatabase::create("last_seen").await?;
+        let result = async {
+            let repository = TokenRepository::new(pool.clone());
+            let key = HmacKey::new("last-seen", &[9_u8; 32]).expect("valid key");
+            let user_id = insert_transport_test_user(&pool, "transport-token-user").await?;
+            let generated = repository
+                .create_token(user_id, &key, "transport", "read", None)
+                .await?;
+            let auth = McpAuth::Repository {
+                repository,
+                hmac_keys: Arc::new(vec![key]),
+            };
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {}", generated.raw_token))
+                    .expect("valid auth header"),
+            );
+
+            let first = auth
+                .authenticate(&headers)
+                .await
+                .expect("token authenticates")
+                .expect("repository auth returns token");
+            assert_eq!(first.id, generated.insert.id);
+            let first_seen = token_last_seen_at(&pool, generated.insert.id)
+                .await?
+                .expect("first auth updates last_seen_at");
+
+            let second = auth
+                .authenticate(&headers)
+                .await
+                .expect("token authenticates again")
+                .expect("repository auth returns token");
+            assert_eq!(second.id, generated.insert.id);
+            let second_seen = token_last_seen_at(&pool, generated.insert.id)
+                .await?
+                .expect("last_seen_at remains set");
+
+            assert_eq!(second_seen, first_seen);
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        pool.close().await;
+        let drop_result = database.drop().await;
+        result?;
+        drop_result
+    }
+
+    #[derive(Debug)]
+    struct TransportTestDatabase {
+        database: String,
+    }
+
+    impl TransportTestDatabase {
+        async fn create(name: &str) -> anyhow::Result<(Self, PgPool)> {
+            let database = format!("joplin_mcpd_transport_{name}_{}", Uuid::new_v4().simple());
+            let admin =
+                connect_transport_test_pool(transport_test_postgres_options("postgres")).await?;
+            sqlx::query(&format!(r#"CREATE DATABASE "{database}""#))
+                .execute(&admin)
+                .await
+                .with_context(|| format!("create disposable database {database}"))?;
+            admin.close().await;
+
+            let pool =
+                connect_transport_test_pool(transport_test_postgres_options(&database)).await?;
+            migrations::run(&pool)
+                .await
+                .context("run MCP migrations for transport test")?;
+            Ok((Self { database }, pool))
+        }
+
+        async fn drop(self) -> anyhow::Result<()> {
+            let database = self.database;
+            let admin =
+                connect_transport_test_pool(transport_test_postgres_options("postgres")).await?;
+            sqlx::query(&format!(
+                r#"DROP DATABASE IF EXISTS "{database}" WITH (FORCE)"#
+            ))
+            .execute(&admin)
+            .await
+            .with_context(|| format!("drop disposable database {database}"))?;
+            admin.close().await;
+            Ok(())
+        }
+    }
+
+    fn transport_test_postgres_options(database: &str) -> PgConnectOptions {
+        PgConnectOptions::new()
+            .host("127.0.0.1")
+            .port(55432)
+            .username("postgres")
+            .password("local-postgres")
+            .database(database)
+    }
+
+    async fn connect_transport_test_pool(options: PgConnectOptions) -> anyhow::Result<PgPool> {
+        PgPoolOptions::new()
+            .max_connections(4)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect_with(options)
+            .await
+            .context("connect to disposable local Postgres")
+    }
+
+    async fn insert_transport_test_user(
+        pool: &PgPool,
+        joplin_user_id: &str,
+    ) -> anyhow::Result<Uuid> {
+        let user_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO joplin_mcp.mcp_users (id, joplin_user_id, joplin_email, last_login_at)
+            VALUES ($1, $2, $3, now())
+            "#,
+        )
+        .bind(user_id)
+        .bind(joplin_user_id)
+        .bind(format!("{joplin_user_id}@example.test"))
+        .execute(pool)
+        .await
+        .context("insert disposable MCP user")?;
+        Ok(user_id)
+    }
+
+    async fn token_last_seen_at(
+        pool: &PgPool,
+        token_id: Uuid,
+    ) -> anyhow::Result<Option<DateTime<Utc>>> {
+        sqlx::query_scalar(
+            r#"
+            SELECT last_seen_at
+            FROM joplin_mcp.mcp_tokens
+            WHERE id = $1
+            "#,
+        )
+        .bind(token_id)
+        .fetch_one(pool)
+        .await
+        .context("read token last_seen_at")
     }
 }
